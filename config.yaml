@@ -1,0 +1,109 @@
+mode: paper
+
+bybit:
+  api_key: "YOUR_API_KEY"
+  api_secret: "YOUR_API_SECRET"
+  testnet: true
+
+paper:
+  starting_cash: 10000.0
+  slippage_bps: 5
+  commission_per_contract: 0.0   # Bybit has taker/maker fees; set accordingly
+
+universe:
+  symbols: ["BTC", "ETH"]        # underlying assets to scan
+  wheel_watchlist: ["BTC", "ETH"] # for cash-secured puts
+  min_avg_option_volume: 0       # optional; crypto volume is generally high
+
+scan:
+  poll_interval_seconds: 900     # 15 minutes
+
+strategies:
+  credit_spreads:
+    enabled: true
+    min_iv_rank: 50
+    target_short_delta: 0.20
+    min_credit_to_width_ratio: 0.25
+    dte_min: 7
+    dte_max: 30
+    max_leg_spread_pct: 0.20
+  directional:
+    enabled: true
+    trend_lookback_days: 20
+    volume_multiple_trigger: 1.5
+    min_iv_rank: 20
+    max_iv_rank: 60
+    dte_min: 10
+    dte_max: 30
+    max_leg_spread_pct: 0.20
+  earnings_vol:
+    enabled: false   # not applicable for crypto
+  wheel:
+    enabled: true
+    csp_target_delta: 0.25
+    covered_call_target_delta: 0.25
+    dte_min: 7
+    dte_max: 30
+    max_leg_spread_pct: 0.20
+
+risk:
+  max_risk_per_trade_pct: 0.02
+  max_concurrent_positions: 4
+  max_positions_per_symbol: 1
+  max_new_trades_per_day: 5
+
+approval:
+  timeout_minutes: 15
+
+telegram:
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+  chat_id: "YOUR_CHAT_ID"
+
+learning:
+  enabled: true
+  min_trades_for_multiplier: 5
+  multiplier_floor: 0.5
+  multiplier_ceiling: 1.5
+  use_ml: false
+  ml_min_training_rows: 150
+  ml_retrain_every_n_trades: 25
+  ml_model_path: "./learning_model.joblib"
+  ml_blend_weight: 0.3
+  outcome_poll_minutes: 45
+  report_day_of_week: "sun"
+  report_hour: 18
+
+guardrails:
+  enabled: true
+  min_trades_for_stats: 5
+  max_consecutive_losses: 3
+  min_win_rate: 0.30
+  max_cumulative_loss_dollars: 500
+  ban_duration_days: 90
+
+sentiment:
+  enabled: false   # disable until crypto-specific indicators are added
+  persistence_days: 3
+  directional_vix_min: 15.0
+  directional_vix_max: 25.0
+  directional_vix_band_multiplier: 0.0
+  # ... other FRED/Finnhub settings can be left as defaults or removed
+
+circuit_breaker:
+  enabled: true
+  daily_loss_limit_dollars: 1000
+  manual_kill: false
+  check_interval_seconds: 900
+
+exits:
+  enabled: true
+  default_stop_loss_pct:
+    credit_spreads: 0.50
+    directional: 0.50
+    wheel: 0.50
+  default_take_profit_pct:
+    credit_spreads: 0.50
+    directional: 1.00
+    wheel: 0.50
+  force_exit_dte: 7
+  approval_timeout_minutes: 10

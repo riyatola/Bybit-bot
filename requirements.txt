@@ -1,0 +1,6 @@
+PyYAML
+requests
+python-telegram-bot
+apscheduler
+sqlite3   # built-in
+logging   # built-in
