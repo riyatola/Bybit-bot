@@ -1,16 +1,17 @@
 """
 Main entrypoint for crypto options bot (Bybit).
-Wires together: auth, market data, strategies, risk, approval, notifier, learning, guardrails, sentiment, circuit breaker.
+Wires together: auth, market data, strategies, risk, approval, notifier, learning, guardrails, bybit_alpha, sentiment, circuit breaker.
 """
 
 import asyncio
 import argparse
 import logging
+import sys
 import yaml
 from datetime import date
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from bybit_client import BybitClient
+from bybit_client import BybitClient, _format_api_error
 from market_data import MarketDataAdapter
 from paper_broker import PaperBrokerClient
 from risk_manager import RiskManager
@@ -21,15 +22,30 @@ from strategies import credit_spreads, directional, earnings_vol, wheel
 from guardrails import Guardrails
 from learning import LearningEngine
 from sentiment import SentimentEngine
+from bybit_alpha import BybitAlphaEngine
 from circuit_breaker import CircuitBreaker
 from exit_manager import ExitManager
 from trade_tracker import TradeTracker
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()],
-)
+def _configure_logging():
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler("bot.log", encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+        force=True,
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+_configure_logging()
 log = logging.getLogger("scanner")
 
 
@@ -44,7 +60,7 @@ def get_universe(cfg):
 
 
 async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notifier,
-                         guardrails, learning, sentiment, circuit_breaker):
+                         guardrails, learning, bybit_alpha, sentiment, circuit_breaker):
     db.expire_stale()
 
     if circuit_breaker.is_tripped():
@@ -57,6 +73,10 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
 
     snapshot = risk.account_snapshot(client, account_hash)
     symbols = get_universe(cfg)
+
+    if bybit_alpha.cfg.get("enabled", False):
+        bybit_alpha.refresh_signals(symbols)
+        log.info("Bybit alpha signals refreshed for %s", symbols)
 
     # Filter banned symbols
     active_bans = {b["symbol"] for b in guardrails.list_active_bans()}
@@ -92,8 +112,9 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
 
     log.info("Found %d raw candidates", len(all_candidates))
 
-    # Apply learning and sentiment adjustments
+    # Apply learning, Bybit alpha, and sentiment adjustments
     all_candidates = [learning.apply(c) for c in all_candidates]
+    all_candidates = [bybit_alpha.apply(c) for c in all_candidates]
     all_candidates = [sentiment.apply(c) for c in all_candidates]
     all_candidates.sort(key=lambda c: c["score"], reverse=True)
 
@@ -129,10 +150,10 @@ async def run_exit_check(exit_manager, db, notifier, circuit_breaker):
         log.info(f"Sent exit approval for trade {trigger['trade_id']}")
 
 
-async def run_learning_cycle(db, guardrails, learning, sentiment, notifier):
+async def run_learning_cycle(db, guardrails, learning, bybit_alpha, sentiment, notifier):
     newly_banned = guardrails.evaluate_all_symbols()
     learning.maybe_retrain_ml_model()
-    summary = learning.summarize() + "\n\n" + sentiment.summarize()
+    summary = learning.summarize() + "\n\n" + bybit_alpha.summarize() + "\n\n" + sentiment.summarize()
     active_bans = guardrails.list_active_bans()
     await notifier.send_learning_report(summary, newly_banned, active_bans)
 
@@ -151,12 +172,12 @@ async def main():
     )
 
     if args.auth_only:
-        # Test connectivity by fetching account info
         try:
             real_client.account_info()
-            log.info("Auth successful, tokens valid.")
+            log.info("Auth successful — Bybit API key accepted.")
         except Exception as e:
-            log.error("Auth failed: %s", e)
+            log.error("Auth failed: %s", _format_api_error(e, testnet=bybit_cfg.get("testnet", True)))
+            sys.exit(1)
         return
 
     # Paper wrapper if mode is paper
@@ -172,6 +193,7 @@ async def main():
     market_data = MarketDataAdapter(client, cfg=cfg)
     guardrails = Guardrails(cfg, db)
     learning = LearningEngine(cfg, db)
+    bybit_alpha = BybitAlphaEngine(cfg, db, client, market_data)
     sentiment = SentimentEngine(cfg, db, market_data=market_data)  # can be disabled in config
     risk = RiskManager(cfg, db, guardrails=guardrails, market_data=market_data)
     circuit_breaker = CircuitBreaker(cfg, db, client, account_hash, paper_mode=(cfg.get("mode")=="paper"))
@@ -190,13 +212,14 @@ async def main():
         "interval",
         seconds=cfg["scan"]["poll_interval_seconds"],
         args=[client, account_hash, cfg, market_data, risk, db, notifier,
-              guardrails, learning, sentiment, circuit_breaker],
+              guardrails, learning, bybit_alpha, sentiment, circuit_breaker],
     )
 
     scheduler.add_job(
-        lambda: asyncio.create_task(run_exit_check(exit_manager, db, notifier, circuit_breaker)),
+        run_exit_check,
         "interval",
         seconds=cfg["scan"]["poll_interval_seconds"],
+        args=[exit_manager, db, notifier, circuit_breaker],
     )
 
     scheduler.add_job(
@@ -206,10 +229,11 @@ async def main():
     )
 
     scheduler.add_job(
-        lambda: asyncio.create_task(run_learning_cycle(db, guardrails, learning, sentiment, notifier)),
+        run_learning_cycle,
         "cron",
         day_of_week=cfg.get("learning", {}).get("report_day_of_week", "sun"),
         hour=cfg.get("learning", {}).get("report_hour", 18),
+        args=[db, guardrails, learning, bybit_alpha, sentiment, notifier],
     )
 
     # Paper-only: settle expired positions daily (no early assignment)
@@ -220,7 +244,7 @@ async def main():
 
     # Run initial scan
     await run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notifier,
-                         guardrails, learning, sentiment, circuit_breaker)
+                         guardrails, learning, bybit_alpha, sentiment, circuit_breaker)
 
     # Keep running
     while True:

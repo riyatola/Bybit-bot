@@ -16,10 +16,34 @@ touch the network, same as if auth failed).
 
 import json
 import logging
+import sys
 import uuid
 from datetime import datetime, timedelta
 
 log = logging.getLogger("bybit_client")
+
+try:
+    from pybit.exceptions import FailedRequestError
+except ImportError:
+    FailedRequestError = None  # type: ignore
+
+
+def _format_api_error(exc: Exception, testnet: bool = True) -> str:
+    """ASCII-safe error text with hints for common Bybit auth failures."""
+    text = str(exc).replace("\u2192", "->").replace("\u2014", "-")
+    if "401" in text or "ErrCode: 401" in text:
+        env = "testnet" if testnet else "mainnet"
+        portal = (
+            "https://testnet.bybit.com/app/user/api-management"
+            if testnet
+            else "https://www.bybit.com/app/user/api-management"
+        )
+        text += (
+            f" | Bybit {env} rejected these API credentials. Create keys at {portal}, "
+            f"set testnet: {str(testnet).lower()} in config.yaml, and enable "
+            "Read + Trade permissions (Unified account). Mainnet keys do not work on testnet."
+        )
+    return text
 
 try:
     from pybit.unified_trading import HTTP
@@ -85,8 +109,9 @@ class BybitClient:
             resp = self._session.get_wallet_balance(accountType="UNIFIED")
             return resp
         except Exception as e:
-            log.error("account_info failed: %s", e)
-            raise
+            msg = _format_api_error(e, testnet=self.testnet)
+            log.error("account_info failed: %s", msg)
+            raise RuntimeError(msg) from e
 
     def account_details(self, account_hash: str, fields: str = "positions") -> _FakeResponse:
         """Schwab-compatible: returns json()['securitiesAccount']['positions']."""
@@ -324,6 +349,56 @@ class BybitClient:
         except Exception as e:
             log.debug("get_linear_tickers: %s", e)
             return []
+
+    def get_linear_ticker(self, symbol: str) -> dict | None:
+        """Single linear/perp ticker (funding rate, OI, mark price). symbol e.g. BTCUSDT."""
+        sym = symbol.upper()
+        if not sym.endswith("USDT"):
+            sym = f"{sym}USDT"
+        try:
+            if self._session:
+                resp = self._session.get_tickers(category="linear", symbol=sym)
+                items = resp.get("result", {}).get("list", [])
+                return items[0] if items else None
+            data = self._public_get("/v5/market/tickers", {"category": "linear", "symbol": sym})
+            items = (data or {}).get("list", [])
+            return items[0] if items else None
+        except Exception as e:
+            log.debug("get_linear_ticker %s: %s", sym, e)
+            return None
+
+    def get_long_short_ratio(self, symbol: str, period: str = "1h", limit: int = 3) -> list[dict]:
+        """Account long/short holder ratios for a linear symbol."""
+        sym = symbol.upper()
+        if not sym.endswith("USDT"):
+            sym = f"{sym}USDT"
+        params = {"category": "linear", "symbol": sym, "period": period, "limit": limit}
+        try:
+            if self._session:
+                resp = self._session.get_long_short_ratio(**params)
+                if resp.get("retCode") == 0:
+                    return resp.get("result", {}).get("list", [])
+            data = self._public_get("/v5/market/account-ratio", params)
+            return (data or {}).get("list", [])
+        except Exception as e:
+            log.debug("get_long_short_ratio %s: %s", sym, e)
+            return []
+
+    def _public_get(self, path: str, params: dict) -> dict | None:
+        """Public market endpoint — works without pybit or API keys."""
+        import requests
+        host = "https://api-testnet.bybit.com" if self.testnet else "https://api.bybit.com"
+        try:
+            resp = requests.get(f"{host}{path}", params=params, timeout=15)
+            resp.raise_for_status()
+            body = resp.json()
+            if body.get("retCode") != 0:
+                log.debug("Bybit public GET %s: %s", path, body.get("retMsg"))
+                return None
+            return body.get("result")
+        except Exception as e:
+            log.debug("public GET %s failed: %s", path, e)
+            return None
 
     # ---------------- translation helpers ----------------
 

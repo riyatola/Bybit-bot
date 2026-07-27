@@ -56,6 +56,31 @@ def format_candidate_message(candidate: dict) -> str:
             if candidate.get("vix_band_multiplier") is not None and candidate["vix_band_multiplier"] != 1.0:
                 sent_line += f", VIX outside band {candidate['vix_band_multiplier']:.2f}x"
             lines.append(sent_line)
+
+        if candidate.get("bybit_alpha_multiplier") is not None and candidate["bybit_alpha_multiplier"] != 1.0:
+            alpha_line = (
+                f"Bybit alpha: {candidate.get('bybit_alpha_bias', 'NEUTRAL')} "
+                f"({candidate['bybit_alpha_multiplier']:.2f}x"
+            )
+            parts = []
+            if candidate.get("bybit_alpha_ls_multiplier") not in (None, 1.0):
+                parts.append(f"L/S {candidate['bybit_alpha_ls_multiplier']:.2f}x")
+            if candidate.get("bybit_alpha_funding_multiplier") not in (None, 1.0):
+                parts.append(f"funding {candidate['bybit_alpha_funding_multiplier']:.2f}x")
+            if candidate.get("bybit_alpha_skew_multiplier") not in (None, 1.0):
+                parts.append(f"skew {candidate['bybit_alpha_skew_multiplier']:.2f}x")
+            if parts:
+                alpha_line += ", " + ", ".join(parts)
+            alpha_line += ")"
+            if candidate.get("score_before_bybit_alpha") is not None:
+                alpha_line = (
+                    f"Score after alpha: {candidate['score']:.2f} "
+                    f"(pre-alpha {candidate['score_before_bybit_alpha']:.2f}) — {alpha_line}"
+                )
+            lines.append(alpha_line)
+        elif candidate.get("bybit_alpha_bias"):
+            lines.append(f"Bybit alpha: {candidate['bybit_alpha_bias']} (no score adjustment)")
+
         if not candidate.get("trigger_type"):
             lines.append(f"Rationale: {candidate.get('rationale', '')}")
     return "\n".join(lines)

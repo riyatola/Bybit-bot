@@ -91,6 +91,12 @@ class PaperBrokerClient:
     def get_linear_tickers(self, category: str = "linear") -> list[dict]:
         return self.real.get_linear_tickers(category)
 
+    def get_linear_ticker(self, symbol: str):
+        return self.real.get_linear_ticker(symbol)
+
+    def get_long_short_ratio(self, symbol: str, period: str = "1h", limit: int = 3) -> list[dict]:
+        return self.real.get_long_short_ratio(symbol, period, limit)
+
     # -------------------- identity / connectivity --------------------------------------
 
     def account_info(self) -> dict:
