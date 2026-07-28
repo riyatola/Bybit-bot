@@ -9,8 +9,7 @@ import logging
 import os
 import sys
 import yaml
-from datetime import date
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import date, datetime, timedelta
 
 from bybit_client import BybitClient, _format_api_error
 from market_data import MarketDataAdapter
@@ -20,6 +19,10 @@ from approval_manager import Db
 from notifier import TelegramNotifier
 from executor import Executor
 from strategies import credit_spreads, directional, earnings_vol, wheel
+from strategies import (
+    vrp_strangle, calendar_spread, risk_reversal,
+    event_straddle, funding_carry, broken_wing_butterfly,
+)
 from guardrails import Guardrails
 from learning import LearningEngine
 from sentiment import SentimentEngine
@@ -27,6 +30,7 @@ from bybit_alpha import BybitAlphaEngine
 from circuit_breaker import CircuitBreaker
 from exit_manager import ExitManager
 from trade_tracker import TradeTracker
+from hedge_manager import DeltaHedger
 from health_server import start_health_server_async, mark_event, get_port
 
 
@@ -195,8 +199,11 @@ def get_universe(cfg):
 
 
 async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notifier,
-                         guardrails, learning, bybit_alpha, sentiment, circuit_breaker):
+                         guardrails, learning, bybit_alpha, sentiment, circuit_breaker,
+                         executor=None):
     db.expire_stale()
+    if hasattr(risk, "reset_scan_caches"):
+        risk.reset_scan_caches()
 
     if circuit_breaker.is_tripped():
         log.warning("Circuit breaker tripped, skipping scan")
@@ -246,6 +253,26 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
     if s_cfg["wheel"]["enabled"]:
         all_candidates += wheel.scan(client, snapshot["positions"], cfg, market_data)
 
+    # Elite strategy pack (A-F). Each module also checks its own
+    # strategies.<name>.enabled flag internally, but we gate on cfg here
+    # too so a missing config block doesn't crash a strategy that's
+    # simply not configured yet.
+    for name, mod, needs_positions in (
+        ("vrp_strangle", vrp_strangle, False),
+        ("calendar_spread", calendar_spread, False),
+        ("risk_reversal", risk_reversal, False),
+        ("event_straddle", event_straddle, False),
+        ("funding_carry", funding_carry, False),
+        ("broken_wing_butterfly", broken_wing_butterfly, False),
+    ):
+        strat_cfg = s_cfg.get(name, {})
+        if not strat_cfg.get("enabled", False):
+            continue
+        try:
+            all_candidates += mod.scan(client, symbols, cfg, market_data)
+        except Exception:
+            log.exception("Strategy %s scan failed — skipping this cycle", name)
+
     log.info("Found %d raw candidates", len(all_candidates))
 
     # Apply learning, Bybit alpha, and sentiment adjustments
@@ -261,10 +288,54 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
         if not risk.gate(candidate, snapshot):
             continue
 
-        approval_id = db.create_approval(candidate, cfg["approval"]["timeout_minutes"])
+        approval_cfg = cfg.get("approval", {}) or {}
+        # Tiered auto-approval (Priority 3b):
+        #   auto_approve_score_threshold (default: 0.85)
+        #   set to >1.0 to disable entirely (every trade requires manual OK)
+        auto_threshold = float(approval_cfg.get("auto_approve_score_threshold") or 0.85)
+        approval_timeout = int(approval_cfg.get("timeout_minutes") or 30)
+        approval_id = db.create_approval(candidate, approval_timeout)
+
+        score = float(candidate.get("score") or 0)
+        # Also require: not an exit approval, mode is either paper OR auto-approve is
+        # explicitly enabled via ALLOW_AUTO_APPROVE=1 for live mode safety gating.
+        is_exit_candidate = bool(candidate.get("is_exit_trade"))
+        live_allowed = str(os.environ.get("ALLOW_AUTO_APPROVE", "0")).lower() in (
+            "1", "true", "yes", "paper_mode_ok"
+        )
+        paper_mode = (cfg.get("mode", "paper") or "paper").lower() == "paper"
+        can_auto = (
+            executor is not None
+            and not is_exit_candidate
+            and (paper_mode or live_allowed)
+            and score >= auto_threshold
+        )
+
+        if can_auto:
+            # Auto-approve: same flow as Telegram's APPROVE button, but here.
+            log.info("Auto-approving %s (%s) score=%.2f >= threshold %.2f",
+                     candidate["symbol"], candidate["strategy"], score, auto_threshold)
+            db.set_status(approval_id, "APPROVED")
+            try:
+                order_id = await executor.execute(candidate, approval_id)
+                db.set_status(approval_id, "EXECUTED")
+                await notifier.send_note(
+                    f"🤖 Auto-executed {candidate['symbol']} {candidate['strategy']} "
+                    f"(score {score:.2f}) — order_id: {order_id}"
+                )
+                log.info("Auto-execute OK: approval %s → order %s", approval_id, order_id)
+            except Exception as e:
+                log.exception("Auto-execute FAILED for approval %s", approval_id)
+                db.set_status(approval_id, "FAILED")
+                await notifier.send_note(
+                    f"⚠️ Auto-execute FAILED for {candidate['symbol']} {candidate['strategy']}: {e}"
+                )
+            continue
+
+        # Below threshold (or live mode + ALLOW_AUTO_APPROVE not set): manual Telegram approval
         await notifier.send_approval_request(approval_id, candidate)
-        log.info("Sent approval %s for %s (%s), score=%.2f",
-                 approval_id, candidate["symbol"], candidate["strategy"], candidate["score"])
+        log.info("Sent approval %s for %s (%s), score=%.2f (threshold %.2f)",
+                 approval_id, candidate["symbol"], candidate["strategy"], score, auto_threshold)
 
     mark_event("scan")
 
@@ -297,6 +368,110 @@ async def run_learning_cycle(db, guardrails, learning, bybit_alpha, sentiment, n
     summary = learning.summarize() + "\n\n" + bybit_alpha.summarize() + "\n\n" + sentiment.summarize()
     active_bans = guardrails.list_active_bans()
     await notifier.send_learning_report(summary, newly_banned, active_bans)
+
+
+async def _run_forever_interval(name: str, seconds: int, coro_fn, *args,
+                                 suppress_exceptions: bool = True,
+                                 initial_delay: int = 0):
+    """Native asyncio interval loop — no thread pools, no hidden schedulers.
+
+    Args:
+        name: Human-readable task name for logs.
+        seconds: Interval between the END of one run and the START of the next.
+        coro_fn: Async callable (not called yet).
+        *args: Positional args forwarded to coro_fn().
+        suppress_exceptions: If True (default), exceptions are logged and the
+            loop continues on the next tick; if False, the task exits and
+            propagates the exception (bot will crash loudly, which is useful
+            for catching startup bugs before supervision).
+        initial_delay: Sleep this many seconds BEFORE the first call (useful
+            to stagger initial tasks so they don't thundering-herd at boot).
+    """
+    log.info("Task %s registered (every %ds, initial_delay=%ds)", name, seconds, initial_delay)
+    if initial_delay > 0:
+        await asyncio.sleep(initial_delay)
+    while True:
+        t0 = datetime.utcnow()
+        try:
+            result = coro_fn(*args)
+            if asyncio.iscoroutine(result):
+                await result
+        except asyncio.CancelledError:
+            log.info("Task %s cancelled — shutting down cleanly", name)
+            return
+        except Exception as e:
+            log.exception("Task %s CRASHED: %s", name, e)
+            if not suppress_exceptions:
+                raise
+        finally:
+            dt_ms = int((datetime.utcnow() - t0).total_seconds() * 1000)
+            mark_event(name)
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            log.info("Task %s sleep cancelled — shutting down cleanly", name)
+            return
+
+
+_WEEKDAY = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+async def _run_weekly_cron(name: str, day_of_week: str, hour: int,
+                            coro_fn, *args, tz_offset_hours: int = 0):
+    """Simple weekly cron using native asyncio only.
+    Fires once per week at the given weekday/hour (with optional UTC offset
+    applied so 18:00 'local sun' doesn't require a tz library)."""
+    target_wd = _WEEKDAY.get((day_of_week or "sun").lower(), 6)
+    log.info("Cron %s registered (weekday=%s hour=%d tz_offset=%+dh)",
+             name, day_of_week, hour, tz_offset_hours)
+    while True:
+        now = datetime.utcnow() + timedelta(hours=tz_offset_hours)
+        # Compute next firing time
+        days_until = (target_wd - now.weekday()) % 7
+        candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if days_until == 0 and now >= candidate:
+            days_until = 7
+        next_run = candidate + timedelta(days=days_until)
+        sleep_s = max(1.0, (next_run - now).total_seconds())
+        log.info("Cron %s next run in %.0fs (≈ %.1fh)", name, sleep_s, sleep_s / 3600)
+        try:
+            await asyncio.sleep(sleep_s)
+        except asyncio.CancelledError:
+            log.info("Cron %s cancelled — shutting down cleanly", name)
+            return
+        # Run it
+        try:
+            result = coro_fn(*args)
+            if asyncio.iscoroutine(result):
+                await result
+        except asyncio.CancelledError:
+            log.info("Cron %s run cancelled", name)
+            return
+        except Exception as e:
+            log.exception("Cron %s CRASHED during run: %s", name, e)
+
+
+async def _run_daily_cron(name: str, hour: int, minute: int, fn, *args,
+                           tz_offset_hours: int = 0):
+    """Run a (sync) callable daily at HH:MM with optional UTC offset.
+    Used for paper-mode expired-position settlement."""
+    log.info("Daily cron %s registered (%02d:%02d, tz_offset=%+dh)",
+             name, hour, minute, tz_offset_hours)
+    while True:
+        now = datetime.utcnow() + timedelta(hours=tz_offset_hours)
+        nxt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if nxt <= now:
+            nxt += timedelta(days=1)
+        sleep_s = max(1.0, (nxt - now).total_seconds())
+        try:
+            await asyncio.sleep(sleep_s)
+        except asyncio.CancelledError:
+            log.info("Daily cron %s cancelled", name)
+            return
+        try:
+            fn(*args)
+        except Exception as e:
+            log.exception("Daily cron %s CRASHED: %s", name, e)
 
 
 async def main():
@@ -357,56 +532,62 @@ async def main():
     trade_tracker = TradeTracker(db, client, account_hash)
     executor = Executor(cfg, client, account_hash, db, trade_tracker=trade_tracker)
     notifier = TelegramNotifier(cfg, db, executor)
+    hedger = DeltaHedger(cfg, db, client, account_hash, market_data)
 
     await notifier.run_polling_forever()
     mark_event("telegram")
     await notifier.send_note("Crypto options scanner started.")
     log.info("Bot online. Health endpoint: http://0.0.0.0:%d/healthz", get_port())
 
-    scheduler = AsyncIOScheduler()
+    poll_s = int(cfg["scan"]["poll_interval_seconds"])
+    outcome_poll_min = int(cfg.get("learning", {}).get("outcome_poll_minutes", 45))
+    learning_wd = cfg.get("learning", {}).get("report_day_of_week", "sun")
+    learning_hour = int(cfg.get("learning", {}).get("report_hour", 18))
 
-    scheduler.add_job(
-        run_scan_cycle,
-        "interval",
-        seconds=cfg["scan"]["poll_interval_seconds"],
-        args=[client, account_hash, cfg, market_data, risk, db, notifier,
-              guardrails, learning, bybit_alpha, sentiment, circuit_breaker],
-    )
+    tasks = []
 
-    scheduler.add_job(
-        run_exit_check,
-        "interval",
-        seconds=cfg["scan"]["poll_interval_seconds"],
-        args=[exit_manager, db, notifier, circuit_breaker],
-    )
+    # Primary scan cycle (fire once immediately, then every poll_s after completion)
+    tasks.append(asyncio.create_task(_run_forever_interval(
+        "scan", poll_s, run_scan_cycle,
+        client, account_hash, cfg, market_data, risk, db, notifier,
+        guardrails, learning, bybit_alpha, sentiment, circuit_breaker, executor,
+    )))
 
-    scheduler.add_job(
-        trade_tracker.poll_and_update_outcomes,
-        "interval",
-        minutes=cfg.get("learning", {}).get("outcome_poll_minutes", 45),
-    )
+    # Exit checks (same cadence as scan)
+    tasks.append(asyncio.create_task(_run_forever_interval(
+        "exit_check", poll_s, run_exit_check,
+        exit_manager, db, notifier, circuit_breaker,
+        initial_delay=int(poll_s * 0.5),  # stagger 50% offset from scan
+    )))
 
-    scheduler.add_job(
-        run_learning_cycle,
-        "cron",
-        day_of_week=cfg.get("learning", {}).get("report_day_of_week", "sun"),
-        hour=cfg.get("learning", {}).get("report_hour", 18),
-        args=[db, guardrails, learning, bybit_alpha, sentiment, notifier],
-    )
+    # Trade outcome polling (every outcome_poll_min minutes)
+    tasks.append(asyncio.create_task(_run_forever_interval(
+        "outcome_poll", outcome_poll_min * 60, trade_tracker.poll_and_update_outcomes,
+    )))
 
-    # Paper-only: settle expired positions daily (no early assignment)
+    # Delta hedging for the unhedged vol-selling/carry strategies (A/B/C/D/E)
+    hedge_interval_s = int(cfg.get("hedge_manager", {}).get("rehedge_interval_seconds", 4 * 3600))
+    if cfg.get("hedge_manager", {}).get("enabled", True):
+        tasks.append(asyncio.create_task(_run_forever_interval(
+            "delta_hedge", hedge_interval_s, hedger.rehedge_all,
+            initial_delay=int(poll_s * 0.75),  # let the first scan cycle land first
+        )))
+
+    # Weekly learning report + guardrails evaluation + ML retrain
+    tasks.append(asyncio.create_task(_run_weekly_cron(
+        "learning_report", learning_wd, learning_hour, run_learning_cycle,
+        db, guardrails, learning, bybit_alpha, sentiment, notifier,
+    )))
+
+    # Paper-only: settle expired positions daily at 16:15
     if hasattr(client, "settle_expired_positions"):
-        scheduler.add_job(client.settle_expired_positions, "cron", hour=16, minute=15)  # adjust time
+        tasks.append(asyncio.create_task(_run_daily_cron(
+            "paper_settle_expired", 16, 15, client.settle_expired_positions,
+        )))
 
-    scheduler.start()
-
-    # Run initial scan
-    await run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notifier,
-                         guardrails, learning, bybit_alpha, sentiment, circuit_breaker)
-
-    # Keep running
-    while True:
-        await asyncio.sleep(3600)
+    # If any task fails without suppress_exceptions, gather() propagates it
+    # (supervision from top-level — no silent scheduler thread death).
+    await asyncio.gather(*tasks, return_exceptions=False)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ still produce candidates and the rest of the bot is exercisable.
 
 import logging
 import math
+import os
 import random
 import time
 from datetime import date, datetime, timedelta
@@ -40,6 +41,17 @@ class MarketDataAdapter:
         self._cache_ttl_sec = self.cfg.get("market_data_cache_ttl_sec", 300)
         self._spot_cache = {}
         self._seed_day = date.today().isoformat()
+        # Live vs synthetic mode:
+        #   Live mode (BOT_MODE=live):  synthetic data is STRICTLY FORBIDDEN.
+        #     Any API failure returns empty payloads + CRITICAL log so ops is alerted.
+        #   Paper mode (default):      synthetic feed is allowed, gated by
+        #     ALLOW_SYNTHETIC env var (defaults to 1 to preserve paper-only behaviour).
+        self._mode = (os.environ.get("BOT_MODE") or (self.cfg.get("mode") or "paper")).lower()
+        self._allow_synthetic = (
+            self._mode == "paper"
+            and str(os.environ.get("ALLOW_SYNTHETIC", "1")) not in ("0", "false", "False", "no", "No")
+        )
+        log.info("MarketDataAdapter: mode=%s allow_synthetic=%s", self._mode, self._allow_synthetic)
 
     # ---------- cached lookup ----------
 
@@ -60,7 +72,13 @@ class MarketDataAdapter:
         if symbol.startswith("$"):
             # Synthetic macro indices — these aren't on Bybit; return a plausible value.
             if symbol.upper() in ("$VIX.X", "$VIX"):
-                return self._synthetic_vix()
+                if self._allow_synthetic:
+                    return self._synthetic_vix()
+                # Live mode: VIX is informational only — return a stable 18
+                # placeholder (used as macro filter input only, not for pricing).
+                # It's fine to hard-code here because it is *never* used for
+                # P/L math, option pricing, or trade execution.
+                return 18.0
             return None
 
         spot = self._cached(f"spot:{symbol}", lambda: self._fetch_spot(symbol))
@@ -79,31 +97,40 @@ class MarketDataAdapter:
         except Exception as e:
             log.debug("_fetch_spot failed for %s: %s", symbol, e)
 
-        seed = hash(f"{symbol}-{self._seed_day}") % 1000
-        s = symbol.upper()
-        if s == "BTC":
-            base = 60000.0 + (seed % 10000)
-        elif s == "ETH":
-            base = 3000.0 + (seed % 800)
-        elif s == "SOL":
-            base = 150.0 + (seed % 60)
-        elif s == "BNB":
-            base = 600.0 + (seed % 120)
-        elif s == "XRP":
-            base = 0.5 + (seed % 30) / 100.0
-        elif s == "DOGE":
-            base = 0.15 + (seed % 10) / 100.0
-        elif s == "ADA":
-            base = 0.4 + (seed % 20) / 100.0
-        elif s == "AVAX":
-            base = 35.0 + (seed % 15)
-        elif s == "MATIC":
-            base = 0.8 + (seed % 40) / 100.0
-        elif s == "DOT":
-            base = 7.0 + (seed % 30) / 10.0
-        else:
-            base = 100.0 + (seed % 500)
-        return round(base, 2)
+        # Synthetic fallback (paper mode only)
+        if self._allow_synthetic:
+            seed = hash(f"{symbol}-{self._seed_day}") % 1000
+            s = symbol.upper()
+            if s == "BTC":
+                base = 60000.0 + (seed % 10000)
+            elif s == "ETH":
+                base = 3000.0 + (seed % 800)
+            elif s == "SOL":
+                base = 150.0 + (seed % 60)
+            elif s == "BNB":
+                base = 600.0 + (seed % 120)
+            elif s == "XRP":
+                base = 0.5 + (seed % 30) / 100.0
+            elif s == "DOGE":
+                base = 0.15 + (seed % 10) / 100.0
+            elif s == "ADA":
+                base = 0.4 + (seed % 20) / 100.0
+            elif s == "AVAX":
+                base = 35.0 + (seed % 15)
+            elif s == "MATIC":
+                base = 0.8 + (seed % 40) / 100.0
+            elif s == "DOT":
+                base = 7.0 + (seed % 30) / 10.0
+            else:
+                base = 100.0 + (seed % 500)
+            return round(base, 2)
+
+        # Live mode: spot is required for real trading. If Bybit didn't return
+        # it, return None and let strategies / risk gate skip this symbol
+        # gracefully. A single None won't crash anything — the caller guards
+        # via "or 100.0" defaults or per-symbol spot checks.
+        log.critical("LIVE DATA FAILURE: unable to fetch spot for %s (Bybit ticker empty/missing)", symbol)
+        return None
 
     def _synthetic_vix(self) -> float:
         seed = hash(self._seed_day) % 100
@@ -188,7 +215,7 @@ class MarketDataAdapter:
     def _build_option_chain(self, underlying: str, dte_min: int, dte_max: int) -> dict:
         spot = self.get_last_price(underlying) or 100.0
 
-        # Try live Bybit option chain + tickers. If both come back empty we go synthetic.
+        # Try live Bybit option chain + tickers.
         instruments = []
         tickers = []
         try:
@@ -200,7 +227,21 @@ class MarketDataAdapter:
 
         if instruments and tickers:
             return self._chain_from_live(instruments, tickers, dte_min, dte_max, spot)
-        return self._chain_synthetic(underlying, spot, dte_min, dte_max)
+
+        # Paper mode only: deterministic synthetic chain so the rest of the
+        # pipeline is exercisable without Bybit option data.
+        if self._allow_synthetic:
+            return self._chain_synthetic(underlying, spot, dte_min, dte_max)
+
+        # Live mode — NO SYNTHETIC FALLBACK. Return empty + alert so ops
+        # knows the bot is blind on this symbol instead of silently trading
+        # against fake prices.
+        log.critical(
+            "LIVE DATA FAILURE: returning EMPTY option chain for %s "
+            "(instruments=%d tickers=%d). This symbol will be skipped this scan.",
+            underlying, len(instruments), len(tickers),
+        )
+        return {}
 
     def _chain_from_live(self, instruments: list, tickers: list, dte_min: int, dte_max: int, spot: float) -> dict:
         tick_map = {t.get("symbol"): t for t in tickers}

@@ -45,6 +45,7 @@ def ensure_trade_outcome_columns(conn: sqlite3.Connection):
         "ALTER TABLE trades ADD COLUMN is_credit BOOLEAN", # whether this was a credit trade
         "ALTER TABLE trades ADD COLUMN expiration TEXT",     # expiration date of the position
         "ALTER TABLE trades ADD COLUMN exit_approval_id TEXT", # if we generated an exit approval
+        "ALTER TABLE trades ADD COLUMN entry_greeks_json TEXT", # PortfolioGreeks-per-contract + contracts, for portfolio aggregation
     ):
         try:
             conn.execute(stmt)
@@ -66,13 +67,20 @@ class TradeTracker:
         """Call right after record_trade() so we have strategy/score/features
         for learning later, even before the trade closes."""
         import json
+        greeks_payload = None
+        if isinstance(candidate.get("_entry_greeks"), dict):
+            greeks_payload = json.dumps(candidate["_entry_greeks"])
+        elif isinstance(candidate.get("_entry_greeks_json"), str):
+            greeks_payload = candidate["_entry_greeks_json"]
         self.conn.execute(
             "UPDATE trades SET strategy=?, score_at_entry=?, features_json=?, outcome='OPEN', "
-            "entry_price=?, stop_loss=?, take_profit=?, is_credit=?, expiration=? WHERE id=?",
+            "entry_price=?, stop_loss=?, take_profit=?, is_credit=?, expiration=?, "
+            "entry_greeks_json=? WHERE id=?",
             (candidate.get("strategy"), candidate.get("score"),
              json.dumps(_extract_features(candidate)),
              candidate.get("est_price"), stop_loss, take_profit,
-             candidate.get("is_credit"), candidate.get("expiration"), trade_id),
+             candidate.get("is_credit"), candidate.get("expiration"),
+             greeks_payload, trade_id),
         )
         self.conn.commit()
 

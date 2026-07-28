@@ -28,7 +28,10 @@ def build_order_payload(candidate: dict) -> dict:
             "quantity": qty * leg.get("ratio", 1),
             "instrument": {
                 "symbol": leg["occ_symbol"],
-                "assetType": "OPTION",
+                # funding_carry.py / hedge_manager.py attach a perp leg with
+                # asset_type="CRYPTO" alongside the option leg(s); default to
+                # OPTION for every other strategy's legs, unchanged.
+                "assetType": leg.get("asset_type", "OPTION"),
             },
         })
 

@@ -1,0 +1,98 @@
+# ---------------------------------------------------------------------------
+# Append/merge this into your existing config.yaml.
+# All six strategies default enabled: true — flip to false individually if
+# you want to phase them in one at a time (recommended: start with just
+# vrp_strangle + hedge_manager on testnet, watch a week of paper P&L, then
+# add the rest).
+# ---------------------------------------------------------------------------
+
+strategies:
+  vrp_strangle:
+    enabled: true
+    min_iv_rank: 40
+    max_iv_rank_to_sell: 85     # hard stop — never sell strangles above this
+    target_short_delta: 0.125
+    dte_min: 7
+    dte_max: 14
+    max_leg_spread_pct: 0.20
+    min_credit_dollars: 5.0
+
+  calendar_spread:
+    enabled: true
+    near_dte_target: 7
+    near_dte_tolerance: 4
+    far_dte_target: 21
+    far_dte_tolerance: 7
+    atm_delta_target: 0.50
+    max_leg_spread_pct: 0.20
+    use_straddle: false          # true = also build the put-side calendar
+    max_net_debit_dollars: 500.0
+
+  risk_reversal:
+    enabled: true
+    trend_lookback_days: 10
+    drawdown_trend_threshold: -0.40
+    euphoria_trend_threshold: 0.40
+    target_delta: 0.25
+    dte_min: 14
+    dte_max: 45
+    max_leg_spread_pct: 0.20
+
+  event_straddle:
+    enabled: true
+    # Keep this list current — FOMC/CPI/ETF-decision dates aren't fetched live.
+    events:
+      - { name: "FOMC", date: "2026-09-16" }
+      - { name: "CPI",  date: "2026-08-13" }
+    pre_event_days_before: 3
+    pre_event_min_iv_rank: 80
+    post_event_days_after: 1
+    post_event_max_iv_rank: 60
+    dte_min: 3
+    dte_max: 21
+    max_leg_spread_pct: 0.20
+
+  funding_carry:
+    enabled: true
+    min_funding_rate: 0.0001
+    call_target_delta: 0.30
+    dte_min: 21
+    dte_max: 45
+    max_leg_spread_pct: 0.20
+    perp_notional_per_call: 1.0
+
+  broken_wing_butterfly:
+    enabled: true
+    direction: "bullish"          # or "bearish"
+    middle_offset_pct: 0.05
+    narrow_wing_pct: 0.05
+    wide_wing_pct: 0.10
+    dte_min: 14
+    dte_max: 45
+    max_leg_spread_pct: 0.20
+    max_net_debit_dollars: 300.0
+
+hedge_manager:
+  enabled: true
+  rehedge_threshold_units: 0.05   # rehedge once |net delta| exceeds this many coins
+  rehedge_interval_seconds: 14400 # 4 hours, per the strategy brief
+
+# Give the new strategies default stop/take-profit percentages too, so
+# exit_manager.py actually manages them instead of only relying on
+# force_exit_dte. Merge these keys into your existing exits: block.
+exits:
+  default_stop_loss_pct:
+    vrp_strangle: 0.50
+    calendar_spread: 0.50
+    risk_reversal: 0.50
+    event_straddle: 0.50
+    funding_carry: 0.50
+    broken_wing_butterfly: 0.50
+  default_take_profit_pct:
+    vrp_strangle: 0.35            # "close at 25-50% of max profit" — tune to taste
+    calendar_spread: 0.50
+    risk_reversal: 1.00
+    event_straddle: 0.50
+    funding_carry: 1.00
+    broken_wing_butterfly: 0.75
+  force_exit_dte: 3               # matches "close at ... 3 DTE" from the VRP brief

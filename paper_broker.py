@@ -46,7 +46,7 @@ class _PaperPosition:
         return {
             "instrument": {
                 "symbol": self.bybit_symbol,
-                "assetType": "OPTION",
+                "assetType": "CRYPTO" if self.option_type == "PERP" else "OPTION",
             },
             "longQuantity": qty_long,
             "shortQuantity": qty_short,
@@ -162,6 +162,27 @@ class PaperBrokerClient:
         }
         return _FakeResponse(200, body=body)
 
+    def _fetch_derivative_positions(self) -> list[dict]:
+        """Paper-mode equivalent of BybitClient._fetch_derivative_positions,
+        so hedge_manager.DeltaHedger can read net perp exposure the same
+        way regardless of mode."""
+        agg: dict[str, float] = {}
+        for p in self._positions:
+            if p.option_type != "PERP":
+                continue
+            agg[p.bybit_symbol] = agg.get(p.bybit_symbol, 0.0) + p.qty
+        out = []
+        for sym, qty in agg.items():
+            if qty == 0:
+                continue
+            underlying = sym.upper().removesuffix("USDT").removesuffix("PERP")
+            out.append({
+                "instrument": {"symbol": underlying, "assetType": "CRYPTO"},
+                "longQuantity": max(qty, 0),
+                "shortQuantity": abs(min(qty, 0)),
+            })
+        return out
+
     # -------------------- order placement ----------------------------------------------
 
     def place_order(self, account_hash: str, schwab_payload: dict) -> _FakeResponse:
@@ -181,19 +202,35 @@ class PaperBrokerClient:
         for leg in legs:
             instr = leg.get("instrument", {})
             sym = instr.get("symbol", "")
+            asset_type = (instr.get("assetType") or "OPTION").upper()
             instruction = (leg.get("instruction") or "").upper()
-            qty_raw = int(leg.get("quantity", 0) or 0)
+            qty_raw = leg.get("quantity", 0) or 0
+            # Perp legs (funding_carry, hedge_manager) carry fractional coin
+            # quantities, e.g. 0.15 BTC — options always trade whole contracts.
+            qty_raw = float(qty_raw) if asset_type == "CRYPTO" else int(qty_raw)
             if qty_raw <= 0:
                 continue
             is_open = "OPEN" in instruction
             is_buy = instruction.startswith("BUY")
             multiplier = self._sign_for_leg(is_buy, is_open)  # signed qty for position
-            # Determine price: use current market for this symbol, apply slippage
-            parsed = self._parse_bybit_symbol_safe(sym)
-            if parsed is None:
-                continue
-            spot = self._get_spot(parsed["underlying"])
-            mark = self._mark_for_symbol(parsed, spot)
+
+            if asset_type == "CRYPTO":
+                underlying = sym.upper().removesuffix("USDT").removesuffix("PERP")
+                spot = self._get_spot(underlying)
+                if spot <= 0:
+                    continue
+                mark = spot
+                parsed = {
+                    "bybit_symbol": sym, "underlying": underlying,
+                    "expiration": "9999-12-31", "strike": 0.0, "option_type": "PERP",
+                }
+            else:
+                # Determine price: use current market for this symbol, apply slippage
+                parsed = self._parse_bybit_symbol_safe(sym)
+                if parsed is None:
+                    continue
+                spot = self._get_spot(parsed["underlying"])
+                mark = self._mark_for_symbol(parsed, spot)
             if mark <= 0:
                 continue
             slippage = mark * self.slippage_bps / 10_000.0
@@ -218,13 +255,15 @@ class PaperBrokerClient:
                 "signed_qty": signed_qty,
                 "parsed": parsed,
                 "commission": comm,
+                "asset_type": asset_type,
             })
 
         # Reject if limit price check fails
-        if limit_price is not None:
+        option_legs_for_pricing = [fl for fl in fill_legs if fl["asset_type"] != "CRYPTO"]
+        if limit_price is not None and option_legs_for_pricing:
             net_per_contract = 0.0
             total_qty = 0
-            for fl in fill_legs:
+            for fl in option_legs_for_pricing:
                 total_qty += fl["quantity"]
                 # NET_CREDIT orders: credit received = sum over (sell-leg - buy-leg). Schwab's 'price' is credit per 1x ratio.
                 # NET_DEBIT orders: price is debit per 1x ratio.
@@ -361,6 +400,8 @@ class PaperBrokerClient:
         return round(base + rnd / 10, 2)
 
     def _mark_for_symbol(self, parsed: dict, spot: float) -> float:
+        if parsed.get("option_type") == "PERP":
+            return spot
         from market_data import MarketDataAdapter
         rng_key = f"{parsed['bybit_symbol']}-mark"
         # Use market_data BS-based fallback via a tiny inline helper
