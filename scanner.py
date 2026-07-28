@@ -288,59 +288,65 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
         if not risk.gate(candidate, snapshot):
             continue
 
-        approval_cfg = cfg.get("approval", {}) or {}
-        # Tiered auto-approval (Priority 3b):
-        #   auto_approve_score_threshold (default: 0.85)
-        #   set to >1.0 to disable entirely (every trade requires manual OK)
-        auto_threshold = float(approval_cfg.get("auto_approve_score_threshold") or 0.85)
-        approval_timeout = int(approval_cfg.get("timeout_minutes") or 30)
-        approval_id = db.create_approval(candidate, approval_timeout)
-
-        score = float(candidate.get("score") or 0)
-        # Also require: not an exit approval, mode is either paper OR auto-approve is
-        # explicitly enabled via ALLOW_AUTO_APPROVE=1 for live mode safety gating.
-        is_exit_candidate = bool(candidate.get("is_exit_trade"))
-        live_allowed = str(os.environ.get("ALLOW_AUTO_APPROVE", "0")).lower() in (
-            "1", "true", "yes", "paper_mode_ok"
-        )
-        paper_mode = (cfg.get("mode", "paper") or "paper").lower() == "paper"
-        can_auto = (
-            executor is not None
-            and not is_exit_candidate
-            and (paper_mode or live_allowed)
-            and score >= auto_threshold
-        )
-
-        if can_auto:
-            # Auto-approve: same flow as Telegram's APPROVE button, but here.
-            log.info("Auto-approving %s (%s) score=%.2f >= threshold %.2f",
-                     candidate["symbol"], candidate["strategy"], score, auto_threshold)
-            db.set_status(approval_id, "APPROVED")
-            try:
-                order_id = await executor.execute(candidate, approval_id)
-                db.set_status(approval_id, "EXECUTED")
-                await notifier.send_note(
-                    f"🤖 Auto-executed {candidate['symbol']} {candidate['strategy']} "
-                    f"(score {score:.2f}) — order_id: {order_id}"
-                )
-                log.info("Auto-execute OK: approval %s → order %s", approval_id, order_id)
-            except Exception as e:
-                log.exception("Auto-execute FAILED for approval %s", approval_id)
-                db.set_status(approval_id, "FAILED")
-                await notifier.send_note(
-                    f"⚠️ Auto-execute FAILED for {candidate['symbol']} {candidate['strategy']}: {e}"
-                )
+        # FULL AUTO MODE (user requested) — every trade that passes gate/size
+        # executes immediately. Telegram sends an audit notification AFTER
+        # execute, never an approval card. ALLOW_AUTO_APPROVE safety env is
+        # bypassed here because user explicitly opted into full automation.
+        if executor is None:
+            log.error("Executor not available — skipping auto-exec of %s %s",
+                      candidate["symbol"], candidate["strategy"])
             continue
 
-        # Below threshold (or live mode + ALLOW_AUTO_APPROVE not set): manual Telegram approval
-        await notifier.send_approval_request(approval_id, candidate)
-        log.info("Sent approval %s for %s (%s), score=%.2f (threshold %.2f)",
-                 approval_id, candidate["symbol"], candidate["strategy"], score, auto_threshold)
+        approval_cfg = cfg.get("approval", {}) or {}
+        approval_timeout = int(approval_cfg.get("timeout_minutes") or 15)
+        # Create PENDING approval record first (for audit trail even in auto mode)
+        approval_id = db.create_approval(candidate, approval_timeout)
+        db.set_status(approval_id, "APPROVED")   # full-auto: skip Telegram button flow
+
+        score = float(candidate.get("score") or 0)
+        strat = candidate.get("strategy") or "?"
+        sym = candidate["symbol"]
+        log.info("Auto-executing %s (%s) score=%.2f (approval %s)", sym, strat, score, approval_id)
+        try:
+            order_id = await executor.execute(candidate, approval_id)
+            db.set_status(approval_id, "EXECUTED")
+            log.info("Auto-execute OK: %s (%s) score=%.2f → order_id=%s", sym, strat, score, order_id)
+            # Telegram notification (success) — this is your audit-trail arm.
+            # No button, just the trade receipt.
+            qty = candidate.get("suggested_qty") or candidate.get("num_contracts") or 1
+            credit_debit = "credit" if candidate.get("is_credit") else "debit"
+            price = candidate.get("est_price") or 0
+            risk = candidate.get("total_risk_at_suggested_qty") or 0
+            msg = (
+                f"✅ *TRADE EXECUTED*\n"
+                f"Symbol: `{sym}`\n"
+                f"Strategy: `{strat}`\n"
+                f"Score: `{score:.2f}`\n"
+                f"Contracts: `{qty}`\n"
+                f"{credit_debit.capitalize()}: `${price:.4f}`\n"
+                f"Risk at entry: `${risk:.2f}`\n"
+                f"Order: `{order_id}`\n"
+                f"Approval ID: `{approval_id}`"
+            )
+            if candidate.get("expiration"):
+                msg += f"\nExpiration: `{candidate['expiration']}`"
+            if candidate.get("legs"):
+                for leg in candidate["legs"]:
+                    msg += f"\n  • {leg.get('instruction','?')} {leg.get('option_symbol', leg.get('symbol','?'))}"
+            await notifier.send_note(msg, parse_mode="Markdown")
+        except Exception as e:
+            log.exception("Auto-execute FAILED for approval %s (%s %s)", approval_id, sym, strat)
+            db.set_status(approval_id, "FAILED")
+            err_msg = f"⚠️ *TRADE FAILED*\n{sym} {strat} (score {score:.2f}): `{e}`"
+            try:
+                await notifier.send_note(err_msg, parse_mode="Markdown")
+            except Exception:
+                pass
 
     mark_event("scan")
 
 
-async def run_exit_check(exit_manager, db, notifier, circuit_breaker):
+async def run_exit_check(exit_manager, db, notifier, circuit_breaker, executor=None):
     try:
         if circuit_breaker.is_tripped():
             return
@@ -356,8 +362,44 @@ async def run_exit_check(exit_manager, db, notifier, circuit_breaker):
                 (approval_id, trigger["trade_id"]),
             )
             exit_manager.conn.commit()
-            await notifier.send_approval_request(approval_id, candidate)
-            log.info(f"Sent exit approval for trade {trigger['trade_id']}")
+
+            trade_id = trigger["trade_id"]
+            sym = candidate.get("symbol") or "?"
+            reason = trigger.get("reason") or "?"
+            strat = candidate.get("strategy") or "exit"
+
+            if executor is None:
+                log.error("Executor unavailable — cannot auto-exit trade %s (%s)", trade_id, reason)
+                continue
+
+            db.set_status(approval_id, "APPROVED")
+            log.info("Auto-exiting trade %s (%s, %s), approval %s", trade_id, sym, reason, approval_id)
+            try:
+                order_id = await executor.execute(candidate, approval_id)
+                db.set_status(approval_id, "EXECUTED")
+                log.info("Exit OK: trade %s (%s) → order %s", trade_id, reason, order_id)
+                price = candidate.get("est_price") or 0
+                credit_debit = "credit" if candidate.get("is_credit") else "debit"
+                msg = (
+                    f"🔻 *POSITION EXITED*\n"
+                    f"Trade ID: `{trade_id}`\n"
+                    f"Symbol: `{sym}`\n"
+                    f"Trigger: `{reason}`\n"
+                    f"Strategy: `{strat}`\n"
+                    f"{credit_debit.capitalize()}: `${price:.4f}`\n"
+                    f"Exit Order: `{order_id}`"
+                )
+                await notifier.send_note(msg, parse_mode="Markdown")
+            except Exception as e:
+                log.exception("Exit FAILED for trade %s (approval %s)", trade_id, approval_id)
+                db.set_status(approval_id, "FAILED")
+                err = f"❌ *EXIT FAILED*\n{sym} trade `{trade_id}` reason `{reason}`: `{e}`"
+                try:
+                    await notifier.send_note(err, parse_mode="Markdown")
+                except Exception:
+                    pass
+            continue  # skip the manual approval send (unreachable, belt+suspenders)
+
     finally:
         mark_event("exit_check")
 
@@ -556,7 +598,7 @@ async def main():
     # Exit checks (same cadence as scan)
     tasks.append(asyncio.create_task(_run_forever_interval(
         "exit_check", poll_s, run_exit_check,
-        exit_manager, db, notifier, circuit_breaker,
+        exit_manager, db, notifier, circuit_breaker, executor,
         initial_delay=int(poll_s * 0.5),  # stagger 50% offset from scan
     )))
 
