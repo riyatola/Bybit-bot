@@ -24,7 +24,7 @@ log = logging.getLogger("bybit_alpha")
 
 DEFAULTS = {
     "enabled": True,
-    "cache_ttl_seconds": 900,
+    "cache_ttl_seconds": 300,
     "persistence_readings": 3,
     "long_short": {
         "period": "1h",

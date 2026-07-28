@@ -145,8 +145,8 @@ def load_config(path="config.yaml"):
             "mode": "paper",
             "bybit": {"api_key": "", "api_secret": "", "testnet": True},
             "paper": {"starting_cash": 10000.0, "slippage_bps": 5, "commission_per_contract": 0.0},
-            "universe": {"symbols": ["BTC", "ETH"], "wheel_watchlist": ["BTC", "ETH"], "min_avg_option_volume": 0},
-            "scan": {"poll_interval_seconds": 900},
+            "universe": {"symbols": ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "MATIC", "DOT"], "wheel_watchlist": ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "MATIC", "DOT"], "min_avg_option_volume": 0},
+            "scan": {"poll_interval_seconds": 300},
             "strategies": {
                 "credit_spreads": {"enabled": True, "min_iv_rank": 50, "target_short_delta": 0.20,
                     "min_credit_to_width_ratio": 0.25, "dte_min": 7, "dte_max": 30, "max_leg_spread_pct": 0.20},
@@ -169,7 +169,7 @@ def load_config(path="config.yaml"):
                 "min_win_rate": 0.30, "max_cumulative_loss_dollars": 500, "ban_duration_days": 90},
             "sentiment": {"enabled": False, "persistence_days": 3, "directional_vix_min": 15.0,
                 "directional_vix_max": 25.0, "directional_vix_band_multiplier": 0.0},
-            "bybit_alpha": {"enabled": True, "cache_ttl_seconds": 900, "persistence_readings": 3,
+            "bybit_alpha": {"enabled": True, "cache_ttl_seconds": 300, "persistence_readings": 3,
                 "long_short": {"period": "1h", "extreme_long_ratio": 0.65, "extreme_short_ratio": 0.35},
                 "funding": {"high_positive": 0.0003, "high_negative": -0.0003, "oi_rise_pct": 5.0},
                 "options_skew": {"dte_min": 7, "dte_max": 45, "bearish_put_call_oi": 1.25, "bullish_put_call_oi": 0.80},
@@ -180,7 +180,7 @@ def load_config(path="config.yaml"):
                 },
             },
             "circuit_breaker": {"enabled": True, "daily_loss_limit_dollars": 1000,
-                "manual_kill": False, "check_interval_seconds": 900},
+                "manual_kill": False, "check_interval_seconds": 300},
             "exits": {"enabled": True,
                 "default_stop_loss_pct": {"credit_spreads": 0.50, "directional": 0.50, "wheel": 0.50},
                 "default_take_profit_pct": {"credit_spreads": 0.50, "directional": 1.00, "wheel": 0.50},
@@ -191,7 +191,7 @@ def load_config(path="config.yaml"):
 
 def get_universe(cfg):
     """Static list of underlyings to scan."""
-    return cfg.get("universe", {}).get("symbols", ["BTC", "ETH"])
+    return cfg.get("universe", {}).get("symbols", ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "MATIC", "DOT"])
 
 
 async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notifier,

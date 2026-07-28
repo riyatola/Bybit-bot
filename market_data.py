@@ -80,10 +80,27 @@ class MarketDataAdapter:
             log.debug("_fetch_spot failed for %s: %s", symbol, e)
 
         seed = hash(f"{symbol}-{self._seed_day}") % 1000
-        if symbol.upper() == "BTC":
+        s = symbol.upper()
+        if s == "BTC":
             base = 60000.0 + (seed % 10000)
-        elif symbol.upper() == "ETH":
+        elif s == "ETH":
             base = 3000.0 + (seed % 800)
+        elif s == "SOL":
+            base = 150.0 + (seed % 60)
+        elif s == "BNB":
+            base = 600.0 + (seed % 120)
+        elif s == "XRP":
+            base = 0.5 + (seed % 30) / 100.0
+        elif s == "DOGE":
+            base = 0.15 + (seed % 10) / 100.0
+        elif s == "ADA":
+            base = 0.4 + (seed % 20) / 100.0
+        elif s == "AVAX":
+            base = 35.0 + (seed % 15)
+        elif s == "MATIC":
+            base = 0.8 + (seed % 40) / 100.0
+        elif s == "DOT":
+            base = 7.0 + (seed % 30) / 10.0
         else:
             base = 100.0 + (seed % 500)
         return round(base, 2)
@@ -144,7 +161,7 @@ class MarketDataAdapter:
 
     def get_put_call_ratio(self) -> float:
         """Aggregate put/call volume across the configured universe."""
-        uni = self.cfg.get("universe", {}).get("symbols", ["BTC", "ETH"])
+        uni = self.cfg.get("universe", {}).get("symbols", ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "MATIC", "DOT"])
         p = c = 0.0
         for s in uni:
             chain = self.get_option_chain(s, 1, 60)
@@ -305,7 +322,15 @@ class MarketDataAdapter:
     def _build_iv_history(self, symbol: str, n_days: int) -> list[tuple[str, float]]:
         rng = random.Random(hash(f"ivhist-{symbol}") & 0xFFFFFFFF)
         today = date.today()
-        base_iv = 55.0 if symbol.upper() == "BTC" else 60.0
+        s = symbol.upper()
+        if s == "BTC":
+            base_iv = 55.0
+        elif s == "ETH":
+            base_iv = 60.0
+        elif s in ("SOL", "BNB", "AVAX", "MATIC"):
+            base_iv = 65.0
+        else:
+            base_iv = 70.0
         hist = []
         for i in range(n_days):
             d = today - timedelta(days=n_days - i)
@@ -315,23 +340,67 @@ class MarketDataAdapter:
 
     def _current_atm_iv(self, symbol: str) -> float:
         seed = hash(f"{symbol}-{self._seed_day}-iv") % 1000
-        base = 55.0 if symbol.upper() == "BTC" else 60.0
+        s = symbol.upper()
+        if s == "BTC":
+            base = 55.0
+        elif s == "ETH":
+            base = 60.0
+        elif s in ("SOL", "BNB", "AVAX", "MATIC"):
+            base = 65.0
+        else:
+            base = 70.0
         return round(base + (seed % 30) - 10, 2)
 
     def _today_option_volume(self, symbol: str) -> float:
         rng = random.Random(hash(f"{symbol}-{self._seed_day}-vol") & 0xFFFFFFFF)
-        base = 5000 if symbol.upper() == "BTC" else 3000
+        s = symbol.upper()
+        if s == "BTC":
+            base = 5000
+        elif s == "ETH":
+            base = 4000
+        elif s == "SOL":
+            base = 3000
+        elif s == "BNB":
+            base = 2000
+        elif s == "AVAX":
+            base = 1500
+        elif s in ("XRP", "DOGE"):
+            base = 1200
+        else:
+            base = 1000
         return round(base * (0.5 + rng.random()))
 
     def _avg_option_volume(self, symbol: str, days: int) -> float:
         rng = random.Random(hash(f"{symbol}-avgvol-{days}") & 0xFFFFFFFF)
-        base = 5000 if symbol.upper() == "BTC" else 3000
+        s = symbol.upper()
+        if s == "BTC":
+            base = 5000
+        elif s == "ETH":
+            base = 4000
+        elif s == "SOL":
+            base = 3000
+        elif s == "BNB":
+            base = 2000
+        elif s == "AVAX":
+            base = 1500
+        elif s in ("XRP", "DOGE"):
+            base = 1200
+        else:
+            base = 1000
         return round(base * (0.7 + rng.random() * 0.3))
 
     def _synthetic_bars(self, symbol: str, n: int) -> list[dict]:
         rng = random.Random(hash(f"bars-{symbol}-{n}") & 0xFFFFFFFF)
         spot = self.get_last_price(symbol) or 100.0
-        vol = 0.025 if symbol.upper() == "BTC" else 0.035
+        s = symbol.upper()
+        if s == "BTC":
+            vol = 0.025
+        elif s == "ETH":
+            vol = 0.030
+        elif s in ("SOL", "BNB", "AVAX", "MATIC"):
+            vol = 0.038
+        else:
+            vol = 0.045
         bars = []
         px = spot
         for i in range(n):

@@ -30,6 +30,13 @@ DEFAULTS = {
     "max_concurrent_positions": 4,
     "max_positions_per_symbol": 1,
     "max_new_trades_per_day": 5,
+    "min_contracts_per_trade": 1,
+    "max_contracts_per_trade": 10,
+    "min_credit_dollars": 5.0,
+    "max_credit_dollars": 5000.0,
+    "min_debit_dollars": 10.0,
+    "max_debit_dollars": 5000.0,
+    "max_total_risk_dollars": 5000.0,
 }
 
 
@@ -103,8 +110,8 @@ class RiskManager:
         returns the same candidate. Net-liq aware sizing."""
         max_risk_pct = self.cfg["max_risk_per_trade_pct"] or 0
         if net_liq <= 0:
-            # No account info yet (e.g. first run in paper mode): assume modest $100 risk cap
-            max_risk_dollars = 100.0
+            # No account info yet (e.g. first run in paper mode): assume modest $200 risk cap
+            max_risk_dollars = 200.0
         else:
             max_risk_dollars = net_liq * max_risk_pct
 
@@ -125,15 +132,28 @@ class RiskManager:
             qty = max(1, int(max_risk_dollars // max_loss_per))
 
         # Floor: always at least 1 contract so the human sees a concrete suggestion
-        qty = max(qty, 1)
+        min_qty = int(self.cfg.get("min_contracts_per_trade") or 1)
+        qty = max(qty, min_qty, 1)
         # Optional hard cap from config
         qty_cap = self.cfg.get("max_contracts_per_trade")
         if qty_cap:
             qty = min(qty, int(qty_cap))
 
         candidate["suggested_qty"] = qty
-        candidate["total_risk_at_suggested_qty"] = round(max_loss_per * qty, 2)
+        total_risk = round(max_loss_per * qty, 2)
+        candidate["total_risk_at_suggested_qty"] = total_risk
         candidate["max_risk_per_trade_pct"] = max_risk_pct
+
+        # Hard dollar cap: if total risk still exceeds max_total_risk_dollars,
+        # shrink qty until it fits (but never below min_qty).
+        max_total_risk = float(self.cfg.get("max_total_risk_dollars") or 0)
+        if max_total_risk > 0 and total_risk > max_total_risk:
+            max_qty_fits = max(min_qty, int(max_total_risk // max_loss_per)) if max_loss_per > 0 else min_qty
+            clamped = max(min_qty, min(qty, max_qty_fits))
+            candidate["suggested_qty"] = clamped
+            candidate["total_risk_at_suggested_qty"] = round(max_loss_per * clamped, 2)
+            candidate["_sizing_reason"] = f"clamped to max_total_risk ${max_total_risk:.0f}"
+
         return candidate
 
     # ---------- gating ----------
@@ -143,6 +163,39 @@ class RiskManager:
         proceed to the approval queue, False if it should be dropped."""
         symbol = candidate.get("symbol", "").upper()
         strategy = candidate.get("strategy", "")
+
+        # 0. Credit/Debit dollar gates (micro-premium or crazy-expensive candidates)
+        est_price = float(candidate.get("est_price") or 0)
+        if candidate.get("is_credit"):
+            lo = float(self.cfg.get("min_credit_dollars") or 0)
+            hi = float(self.cfg.get("max_credit_dollars") or 0)
+            if lo > 0 and est_price < lo:
+                log.info("Gate: %s (%s) rejected — credit $%.2f below min $%.2f",
+                         symbol, strategy, est_price, lo)
+                return False
+            if hi > 0 and est_price > hi:
+                log.info("Gate: %s (%s) rejected — credit $%.2f above max $%.2f",
+                         symbol, strategy, est_price, hi)
+                return False
+        else:
+            lo = float(self.cfg.get("min_debit_dollars") or 0)
+            hi = float(self.cfg.get("max_debit_dollars") or 0)
+            if lo > 0 and est_price < lo:
+                log.info("Gate: %s (%s) rejected — debit $%.2f below min $%.2f",
+                         symbol, strategy, est_price, lo)
+                return False
+            if hi > 0 and est_price > hi:
+                log.info("Gate: %s (%s) rejected — debit $%.2f above max $%.2f",
+                         symbol, strategy, est_price, hi)
+                return False
+
+        # 0b. Total-risk dollar cap (after sizing)
+        total_risk = float(candidate.get("total_risk_at_suggested_qty") or 0)
+        risk_cap = float(self.cfg.get("max_total_risk_dollars") or 0)
+        if risk_cap > 0 and total_risk > risk_cap:
+            log.info("Gate: %s (%s) rejected — total risk $%.2f above cap $%.2f",
+                     symbol, strategy, total_risk, risk_cap)
+            return False
 
         # 1. Guardrails dynamic ban
         if self.guardrails and self.guardrails.is_banned(symbol, strategy):
