@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: crypto-options-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u scanner.py
+    healthCheckPath: /healthz
+    autoDeploy: yes
+    envVars:
+      - key: PORT
+        value: "10000"
+
+      - key: BOT_MODE
+        value: paper
+        generateValue: false
+
+      - key: BYBIT_TESTNET
+        value: "true"
+
+      - key: BOT_DATA_DIR
+        value: ./data

@@ -6,6 +6,7 @@ Wires together: auth, market data, strategies, risk, approval, notifier, learnin
 import asyncio
 import argparse
 import logging
+import os
 import sys
 import yaml
 from datetime import date
@@ -26,6 +27,14 @@ from bybit_alpha import BybitAlphaEngine
 from circuit_breaker import CircuitBreaker
 from exit_manager import ExitManager
 from trade_tracker import TradeTracker
+from health_server import start_health_server_async, mark_event, get_port
+
+
+def get_data_dir() -> str:
+    base = os.environ.get("BOT_DATA_DIR", ".")
+    os.makedirs(base, exist_ok=True)
+    return base
+
 
 def _configure_logging():
     if hasattr(sys.stdout, "reconfigure"):
@@ -33,11 +42,12 @@ def _configure_logging():
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+    log_path = os.path.join(get_data_dir(), "bot.log")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[
-            logging.FileHandler("bot.log", encoding="utf-8"),
+            logging.FileHandler(log_path, encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
         ],
         force=True,
@@ -49,9 +59,134 @@ _configure_logging()
 log = logging.getLogger("scanner")
 
 
+def _as_bool(val: str | None, default: bool = False) -> bool:
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _overlay_env_config(cfg: dict) -> dict:
+    """Apply environment-variable overrides for sensitive keys.
+
+    Azure App Service / Container Apps expose Application Settings as env vars.
+    This keeps secrets out of the Docker image and config.yaml in version control.
+    """
+    cfg = dict(cfg)
+
+    # Top-level mode
+    if os.environ.get("BOT_MODE"):
+        cfg["mode"] = os.environ["BOT_MODE"]
+
+    # Bybit credentials + testnet flag
+    bybit = dict(cfg.get("bybit", {}) or {})
+    if os.environ.get("BYBIT_API_KEY"):
+        bybit["api_key"] = os.environ["BYBIT_API_KEY"]
+    if os.environ.get("BYBIT_API_SECRET"):
+        bybit["api_secret"] = os.environ["BYBIT_API_SECRET"]
+    if "BYBIT_TESTNET" in os.environ:
+        bybit["testnet"] = _as_bool(os.environ["BYBIT_TESTNET"], bybit.get("testnet", True))
+    cfg["bybit"] = bybit
+
+    # Telegram
+    tg = dict(cfg.get("telegram", {}) or {})
+    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+        tg["bot_token"] = os.environ["TELEGRAM_BOT_TOKEN"]
+    if os.environ.get("TELEGRAM_CHAT_ID"):
+        tg["chat_id"] = os.environ["TELEGRAM_CHAT_ID"]
+    cfg["telegram"] = tg
+
+    # Learning: resolve ml_model_path relative to BOT_DATA_DIR if it's a relative path
+    learning_cfg = dict(cfg.get("learning", {}) or {})
+    model_path = learning_cfg.get("ml_model_path", "./learning_model.joblib")
+    if model_path and not os.path.isabs(model_path):
+        learning_cfg["ml_model_path"] = os.path.join(get_data_dir(), model_path)
+    cfg["learning"] = learning_cfg
+
+    # Risk / circuit breaker numeric overrides (optional)
+    risk = dict(cfg.get("risk", {}) or {})
+    for env_key, cfg_key in (
+        ("RISK_MAX_PCT", "max_risk_per_trade_pct"),
+        ("RISK_MAX_CONCURRENT", "max_concurrent_positions"),
+        ("RISK_MAX_PER_SYMBOL", "max_positions_per_symbol"),
+        ("RISK_MAX_NEW_PER_DAY", "max_new_trades_per_day"),
+    ):
+        if os.environ.get(env_key):
+            try:
+                risk[cfg_key] = float(os.environ[env_key]) if "." in os.environ[env_key] else int(os.environ[env_key])
+            except ValueError:
+                pass
+    cfg["risk"] = risk
+
+    cb = dict(cfg.get("circuit_breaker", {}) or {})
+    if os.environ.get("CIRCUIT_DAILY_LOSS_DOLLARS"):
+        try:
+            cb["daily_loss_limit_dollars"] = float(os.environ["CIRCUIT_DAILY_LOSS_DOLLARS"])
+        except ValueError:
+            pass
+    if "CIRCUIT_MANUAL_KILL" in os.environ:
+        cb["manual_kill"] = _as_bool(os.environ["CIRCUIT_MANUAL_KILL"], False)
+    cfg["circuit_breaker"] = cb
+
+    return cfg
+
+
 def load_config(path="config.yaml"):
-    with open(path) as f:
-        return yaml.safe_load(f)
+    env_path = os.environ.get("CONFIG_PATH") or path
+    if not os.path.isabs(env_path):
+        env_path = os.path.join(get_data_dir(), env_path)
+    # If config file doesn't exist (e.g. user relies fully on env vars),
+    # use a minimal skeleton so env overlay still works.
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    else:
+        log.warning("Config file not found at %s — falling back to env-var-only config.", env_path)
+        cfg = {
+            "mode": "paper",
+            "bybit": {"api_key": "", "api_secret": "", "testnet": True},
+            "paper": {"starting_cash": 10000.0, "slippage_bps": 5, "commission_per_contract": 0.0},
+            "universe": {"symbols": ["BTC", "ETH"], "wheel_watchlist": ["BTC", "ETH"], "min_avg_option_volume": 0},
+            "scan": {"poll_interval_seconds": 900},
+            "strategies": {
+                "credit_spreads": {"enabled": True, "min_iv_rank": 50, "target_short_delta": 0.20,
+                    "min_credit_to_width_ratio": 0.25, "dte_min": 7, "dte_max": 30, "max_leg_spread_pct": 0.20},
+                "directional": {"enabled": True, "trend_lookback_days": 20, "volume_multiple_trigger": 1.5,
+                    "min_iv_rank": 20, "max_iv_rank": 60, "dte_min": 10, "dte_max": 30, "max_leg_spread_pct": 0.20},
+                "earnings_vol": {"enabled": False},
+                "wheel": {"enabled": True, "csp_target_delta": 0.25, "covered_call_target_delta": 0.25,
+                    "dte_min": 7, "dte_max": 30, "max_leg_spread_pct": 0.20},
+            },
+            "risk": {"max_risk_per_trade_pct": 0.02, "max_concurrent_positions": 4,
+                "max_positions_per_symbol": 1, "max_new_trades_per_day": 5},
+            "approval": {"timeout_minutes": 15},
+            "telegram": {"bot_token": "", "chat_id": ""},
+            "learning": {"enabled": True, "min_trades_for_multiplier": 5, "multiplier_floor": 0.5,
+                "multiplier_ceiling": 1.5, "use_ml": False, "ml_min_training_rows": 150,
+                "ml_retrain_every_n_trades": 25, "ml_model_path": "./learning_model.joblib",
+                "ml_blend_weight": 0.3, "outcome_poll_minutes": 45,
+                "report_day_of_week": "sun", "report_hour": 18},
+            "guardrails": {"enabled": True, "min_trades_for_stats": 5, "max_consecutive_losses": 3,
+                "min_win_rate": 0.30, "max_cumulative_loss_dollars": 500, "ban_duration_days": 90},
+            "sentiment": {"enabled": False, "persistence_days": 3, "directional_vix_min": 15.0,
+                "directional_vix_max": 25.0, "directional_vix_band_multiplier": 0.0},
+            "bybit_alpha": {"enabled": True, "cache_ttl_seconds": 900, "persistence_readings": 3,
+                "long_short": {"period": "1h", "extreme_long_ratio": 0.65, "extreme_short_ratio": 0.35},
+                "funding": {"high_positive": 0.0003, "high_negative": -0.0003, "oi_rise_pct": 5.0},
+                "options_skew": {"dte_min": 7, "dte_max": 45, "bearish_put_call_oi": 1.25, "bullish_put_call_oi": 0.80},
+                "multipliers": {
+                    "directional": {"aligned": 1.12, "crowded_fade": 0.55},
+                    "credit_spreads": {"high_skew_iv": 1.08, "crisis_funding": 0.50},
+                    "wheel": {"extreme_fear": 1.10, "extreme_greed": 0.85},
+                },
+            },
+            "circuit_breaker": {"enabled": True, "daily_loss_limit_dollars": 1000,
+                "manual_kill": False, "check_interval_seconds": 900},
+            "exits": {"enabled": True,
+                "default_stop_loss_pct": {"credit_spreads": 0.50, "directional": 0.50, "wheel": 0.50},
+                "default_take_profit_pct": {"credit_spreads": 0.50, "directional": 1.00, "wheel": 0.50},
+                "force_exit_dte": 7, "approval_timeout_minutes": 10},
+        }
+    return _overlay_env_config(cfg)
 
 
 def get_universe(cfg):
@@ -65,6 +200,7 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
 
     if circuit_breaker.is_tripped():
         log.warning("Circuit breaker tripped, skipping scan")
+        mark_event("scan")
         return
 
     # Refresh macro regime (sentiment may be disabled)
@@ -130,24 +266,29 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
         log.info("Sent approval %s for %s (%s), score=%.2f",
                  approval_id, candidate["symbol"], candidate["strategy"], candidate["score"])
 
+    mark_event("scan")
+
 
 async def run_exit_check(exit_manager, db, notifier, circuit_breaker):
-    if circuit_breaker.is_tripped():
-        return
-    triggers = exit_manager.check_triggers()
-    for trigger in triggers:
+    try:
         if circuit_breaker.is_tripped():
-            break
-        candidate = exit_manager.build_exit_candidate(trigger)
-        timeout = exit_manager.exit_cfg.get("approval_timeout_minutes", 10)
-        approval_id = db.create_approval(candidate, timeout)
-        exit_manager.conn.execute(
-            "UPDATE trades SET exit_approval_id=? WHERE id=?",
-            (approval_id, trigger["trade_id"]),
-        )
-        exit_manager.conn.commit()
-        await notifier.send_approval_request(approval_id, candidate)
-        log.info(f"Sent exit approval for trade {trigger['trade_id']}")
+            return
+        triggers = exit_manager.check_triggers()
+        for trigger in triggers:
+            if circuit_breaker.is_tripped():
+                break
+            candidate = exit_manager.build_exit_candidate(trigger)
+            timeout = exit_manager.exit_cfg.get("approval_timeout_minutes", 10)
+            approval_id = db.create_approval(candidate, timeout)
+            exit_manager.conn.execute(
+                "UPDATE trades SET exit_approval_id=? WHERE id=?",
+                (approval_id, trigger["trade_id"]),
+            )
+            exit_manager.conn.commit()
+            await notifier.send_approval_request(approval_id, candidate)
+            log.info(f"Sent exit approval for trade {trigger['trade_id']}")
+    finally:
+        mark_event("exit_check")
 
 
 async def run_learning_cycle(db, guardrails, learning, bybit_alpha, sentiment, notifier):
@@ -174,11 +315,16 @@ async def main():
     if args.auth_only:
         try:
             real_client.account_info()
+            mark_event("bybit_auth")
             log.info("Auth successful — Bybit API key accepted.")
         except Exception as e:
             log.error("Auth failed: %s", _format_api_error(e, testnet=bybit_cfg.get("testnet", True)))
             sys.exit(1)
         return
+
+    asyncio.create_task(start_health_server_async())
+    log.info("Health server will bind to 0.0.0.0:%d (PORT=%s)",
+             get_port(), os.environ.get("PORT"))
 
     # Paper wrapper if mode is paper
     if cfg.get("mode", "paper") == "paper":
@@ -189,7 +335,17 @@ async def main():
         # For real, we need an account hash – Bybit uses account ID? We'll use a dummy for now.
         account_hash = "REAL_ACCOUNT"  # placeholder; adapt as needed
 
-    db = Db()
+    try:
+        real_client.account_info()
+        mark_event("bybit_auth")
+        log.info("Bybit auth OK (mode=%s, testnet=%s)",
+                 cfg.get("mode", "paper"), bybit_cfg.get("testnet", True))
+    except Exception as e:
+        log.warning("Bybit auth probe failed on startup (continuing anyway): %s",
+                    _format_api_error(e, testnet=bybit_cfg.get("testnet", True)))
+
+    db_path = os.path.join(get_data_dir(), "bot.db")
+    db = Db(db_path)
     market_data = MarketDataAdapter(client, cfg=cfg)
     guardrails = Guardrails(cfg, db)
     learning = LearningEngine(cfg, db)
@@ -203,7 +359,9 @@ async def main():
     notifier = TelegramNotifier(cfg, db, executor)
 
     await notifier.run_polling_forever()
+    mark_event("telegram")
     await notifier.send_note("Crypto options scanner started.")
+    log.info("Bot online. Health endpoint: http://0.0.0.0:%d/healthz", get_port())
 
     scheduler = AsyncIOScheduler()
 

@@ -6,9 +6,10 @@ requests are auto-rejected since option prices move.
 
 import sqlite3
 import json
+import logging
+import os
 import time
 import uuid
-import logging
 from datetime import datetime, timedelta
 
 log = logging.getLogger("approval")
@@ -38,9 +39,39 @@ CREATE TABLE IF NOT EXISTS trades (
 """
 
 
+def _connect(path_or_url: str):
+    """Connect to SQLite file, or to a Turso/libsql DATABASE_URL if provided.
+
+    Turso's libsql-experimental exposes a `connect()` call compatible with
+    sqlite3 for the subset we use (execute, executescript, commit, row
+    access). Setting DATABASE_URL in Render's Environment lets you persist
+    trades/learning/guardrails history across deploys and restarts for free.
+    """
+    url = os.environ.get("DATABASE_URL")
+    if url and (url.startswith("libsql://") or url.startswith("http://") or url.startswith("https://")):
+        try:
+            from libsql_experimental import connect as libsql_connect  # type: ignore
+            token = os.environ.get("DATABASE_AUTH_TOKEN")
+            kwargs = {"sync_url": url}
+            if token:
+                kwargs["auth_token"] = token
+            path_for_local_file = path_or_url or os.environ.get("BOT_DATA_DIR", ".") + "/bot.db"
+            return libsql_connect(path_for_local_file, **kwargs)
+        except ImportError:
+            log.warning(
+                "DATABASE_URL is set (%s) but `pip install libsql-experimental` is missing. "
+                "Falling back to local SQLite. Your data will NOT survive Render deploys/restarts.",
+                url[:32] + "…",
+            )
+        except Exception as e:
+            log.warning("Turso/libsql connect failed, falling back to local SQLite: %s", e)
+    return sqlite3.connect(path_or_url, check_same_thread=False)
+
+
 class Db:
     def __init__(self, path="./bot.db"):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.path = path
+        self.conn = _connect(path)
         self.conn.executescript(SCHEMA)
         self.conn.commit()
 

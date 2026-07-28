@@ -2,3 +2,5 @@ PyYAML
 requests
 python-telegram-bot
 apscheduler
+pybit
+
