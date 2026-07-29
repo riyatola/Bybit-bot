@@ -388,16 +388,48 @@ class PaperBrokerClient:
     def _get_spot(self, underlying: str) -> float:
         sym_usdt = f"{underlying.upper()}USDT"
         try:
-            for t in self.real.get_linear_tickers():
+            # Pass category explicitly (matches market_data.py) so Bybit
+            # returns linear perp tickers. Without this, some Bybit API
+            # variants default to "inverse" and omit AVAX/DOGE/ADA/etc.
+            for t in self.real.get_linear_tickers(category="linear"):
                 if t.get("symbol") == sym_usdt:
                     mp = t.get("markPrice") or t.get("lastPrice")
                     if mp:
                         return float(mp)
         except Exception:
             pass
-        rnd = hash(f"{underlying}-spot-synth") % 10000
-        base = 60000 if underlying.upper() == "BTC" else 3000
-        return round(base + rnd / 10, 2)
+        # Deterministic synthetic fallback (paper mode only).
+        # MUST match the tiers used by MarketDataAdapter._fetch_spot so the
+        # paper broker's BS mark prices are consistent with the strategy's
+        # est_price. A mismatch here causes "debit limit exceeded" rejections
+        # when the broker's mark is 100-1000x larger than the candidate price.
+        from datetime import date as _date
+        seed_day = _date.today().isoformat()
+        seed = hash(f"{underlying.upper()}-{seed_day}") % 1000
+        s = underlying.upper()
+        if s == "BTC":
+            base = 60000.0 + ((hash(f"{s}-base") % 10000) / 1.0)
+        elif s == "ETH":
+            base = 3000.0 + (seed % 800)
+        elif s == "SOL":
+            base = 150.0 + (seed % 60)
+        elif s == "BNB":
+            base = 600.0 + (seed % 120)
+        elif s == "XRP":
+            base = 0.5 + (seed % 30) / 100.0
+        elif s == "DOGE":
+            base = 0.15 + (seed % 10) / 100.0
+        elif s == "ADA":
+            base = 0.4 + (seed % 20) / 100.0
+        elif s == "AVAX":
+            base = 35.0 + (seed % 15)
+        elif s == "MATIC":
+            base = 0.8 + (seed % 40) / 100.0
+        elif s == "DOT":
+            base = 7.0 + (seed % 30) / 10.0
+        else:
+            base = 100.0 + (seed % 500)
+        return round(base, 2)
 
     def _mark_for_symbol(self, parsed: dict, spot: float) -> float:
         if parsed.get("option_type") == "PERP":
