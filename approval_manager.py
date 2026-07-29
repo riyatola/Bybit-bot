@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS trades (
     symbol TEXT,
     strategy TEXT,
     order_json TEXT,
-    schwab_order_id TEXT,
+    order_id TEXT,
     status TEXT,
     created_at TEXT
 );
@@ -292,7 +292,7 @@ class Db:
 
     def create_approval(self, candidate: dict, timeout_minutes: int) -> str:
         approval_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expires = now + timedelta(minutes=timeout_minutes)
         self.conn.execute(
             "INSERT INTO approvals (id, symbol, strategy, candidate_json, created_at, expires_at) "
@@ -318,12 +318,12 @@ class Db:
     def set_status(self, approval_id: str, status: str):
         self.conn.execute(
             "UPDATE approvals SET status=?, decided_at=? WHERE id=?",
-            (status, datetime.utcnow().isoformat(), approval_id),
+            (status, datetime.now(timezone.utc).isoformat(), approval_id),
         )
         self.conn.commit()
 
     def expire_stale(self):
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         cur = self.conn.execute(
             "UPDATE approvals SET status='EXPIRED' WHERE status='PENDING' AND expires_at < ?",
             (now,),
@@ -332,19 +332,25 @@ class Db:
         return cur.rowcount
 
     def count_trades_today(self, day_iso: str) -> int:
+        # Only count trades that actually entered execution flow and are
+        # in a "consumed the cap" state: SUBMITTED, APPROVED, EXECUTED.
+        # Explicitly exclude FAILED (broker rejected them, give the slot back)
+        # and CANCELLED/REJECTED, so a day of order-reject bugs doesn't
+        # permanently block the bot with a zero-success cap.
         row = self.conn.execute(
-            "SELECT COUNT(*) FROM trades WHERE created_at LIKE ?",
+            "SELECT COUNT(*) FROM trades WHERE created_at LIKE ? "
+            "AND status NOT IN ('FAILED','REJECTED','CANCELLED')",
             (f"{day_iso}%",),
         ).fetchone()
         return row[0] if row else 0
 
-    def record_trade(self, approval_id, symbol, strategy, order_json, schwab_order_id, status):
+    def record_trade(self, approval_id, symbol, strategy, order_json, order_id_val, status):
         trade_id = str(uuid.uuid4())
         self.conn.execute(
-            "INSERT INTO trades (id, approval_id, symbol, strategy, order_json, schwab_order_id, status, created_at) "
+            "INSERT INTO trades (id, approval_id, symbol, strategy, order_json, order_id, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (trade_id, approval_id, symbol, strategy, json.dumps(order_json), schwab_order_id,
-             status, datetime.utcnow().isoformat()),
+            (trade_id, approval_id, symbol, strategy, json.dumps(order_json), order_id_val,
+             status, datetime.now(timezone.utc).isoformat()),
         )
         self.conn.commit()
         return trade_id

@@ -18,7 +18,7 @@ import json
 import logging
 import math
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from bybit_client import _FakeResponse
 
@@ -39,7 +39,7 @@ class _PaperPosition:
         self.entry_price = entry_price
         self.entry_ts = entry_ts
 
-    def as_schwab_position(self, mark_price: float, spot: float) -> dict:
+    def as_position_dict(self, mark_price: float, spot: float) -> dict:
         qty_long = max(self.qty, 0)
         qty_short = abs(min(self.qty, 0))
         value = self.qty * mark_price
@@ -141,7 +141,7 @@ class PaperBrokerClient:
             for sym, p in agg.items():
                 mark = self._mark_price(p, spot_map.get(p.underlying, 0))
                 spot = spot_map.get(p.underlying, 0)
-                pos_list.append(p.as_schwab_position(mark, spot))
+                pos_list.append(p.as_position_dict(mark, spot))
                 unrealized_total += (pos_list[-1]["unrealizedProfit"] or 0)
 
         market_value = sum(p.get("marketValue", 0) or 0 for p in pos_list)
@@ -185,14 +185,14 @@ class PaperBrokerClient:
 
     # -------------------- order placement ----------------------------------------------
 
-    def place_order(self, account_hash: str, schwab_payload: dict) -> _FakeResponse:
-        legs = schwab_payload.get("orderLegCollection", [])
+    def place_order(self, account_hash: str, payload: dict) -> _FakeResponse:
+        legs = payload.get("orderLegCollection", [])
         if not legs:
             return _FakeResponse(400, body={"error": "empty order"})
-        order_type = schwab_payload.get("orderType", "NET_DEBIT")
+        order_type = payload.get("orderType", "NET_DEBIT")
         limit_price = None
         try:
-            limit_price = float(schwab_payload.get("price"))
+            limit_price = float(payload.get("price"))
         except (ValueError, TypeError):
             limit_price = None
 
@@ -320,7 +320,7 @@ class PaperBrokerClient:
         self._orders.append({
             "id": order_id,
             "created_at": now,
-            "payload": schwab_payload,
+            "payload": payload,
             "fills": fill_legs,
             "net_cash": net_cash_delta,
         })
@@ -459,11 +459,11 @@ class PaperBrokerClient:
 
     @staticmethod
     def _sign_for_leg(is_buy: bool, is_open: bool) -> int:
-        # Schwab conventions:
+        # Order leg sign conventions (works for both single-leg and multi-leg):
         #   BUY_TO_OPEN  -> +1 (long position)
         #   SELL_TO_OPEN -> -1 (short position)
-        #   BUY_TO_CLOSE -> close a short (-1 -> subtract, so +1 closes it)
-        #   SELL_TO_CLOSE -> close a long (+1 -> subtract, so -1 closes it)
+        #   BUY_TO_CLOSE -> +1 (closes a short by buying it back)
+        #   SELL_TO_CLOSE -> -1 (closes a long by selling it)
         if is_buy:
             return 1
         return -1
