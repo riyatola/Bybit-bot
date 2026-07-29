@@ -161,7 +161,7 @@ def load_config(path="config.yaml"):
                     "dte_min": 7, "dte_max": 30, "max_leg_spread_pct": 0.20},
             },
             "risk": {"max_risk_per_trade_pct": 0.02, "max_concurrent_positions": 4,
-                "max_positions_per_symbol": 1, "max_new_trades_per_day": 5},
+                "max_positions_per_symbol": 1, "max_new_trades_per_day": 10},
             "approval": {"timeout_minutes": 15},
             "telegram": {"bot_token": "", "chat_id": ""},
             "learning": {"enabled": True, "min_trades_for_multiplier": 5, "multiplier_floor": 0.5,
@@ -201,9 +201,12 @@ def get_universe(cfg):
 async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notifier,
                          guardrails, learning, bybit_alpha, sentiment, circuit_breaker,
                          executor=None):
+    from datetime import timezone
     db.expire_stale()
     if hasattr(risk, "reset_scan_caches"):
         risk.reset_scan_caches()
+
+    t_start = datetime.now(timezone.utc)
 
     if circuit_breaker.is_tripped():
         log.warning("Circuit breaker tripped, skipping scan")
@@ -273,7 +276,8 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
         except Exception:
             log.exception("Strategy %s scan failed — skipping this cycle", name)
 
-    log.info("Found %d raw candidates", len(all_candidates))
+    total_candidates = len(all_candidates)
+    log.info("Found %d raw candidates", total_candidates)
 
     # Apply learning, Bybit alpha, and sentiment adjustments
     all_candidates = [learning.apply(c) for c in all_candidates]
@@ -281,12 +285,17 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
     all_candidates = [sentiment.apply(c) for c in all_candidates]
     all_candidates.sort(key=lambda c: c["score"], reverse=True)
 
+    gates_passed = 0
+    executed_count = 0
+    failed_executions = 0
+
     for candidate in all_candidates:
         if circuit_breaker.is_tripped():
             break
         candidate = risk.size_candidate(candidate, snapshot["net_liq"])
         if not risk.gate(candidate, snapshot):
             continue
+        gates_passed += 1
 
         # FULL AUTO MODE (user requested) — every trade that passes gate/size
         # executes immediately. Telegram sends an audit notification AFTER
@@ -310,13 +319,14 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
         try:
             order_id = await executor.execute(candidate, approval_id)
             db.set_status(approval_id, "EXECUTED")
+            executed_count += 1
             log.info("Auto-execute OK: %s (%s) score=%.2f → order_id=%s", sym, strat, score, order_id)
             # Telegram notification (success) — this is your audit-trail arm.
             # No button, just the trade receipt.
             qty = candidate.get("suggested_qty") or candidate.get("num_contracts") or 1
             credit_debit = "credit" if candidate.get("is_credit") else "debit"
             price = candidate.get("est_price") or 0
-            risk = candidate.get("total_risk_at_suggested_qty") or 0
+            risk_amount = candidate.get("total_risk_at_suggested_qty") or 0
             msg = (
                 f"✅ *TRADE EXECUTED*\n"
                 f"Symbol: `{sym}`\n"
@@ -324,7 +334,7 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
                 f"Score: `{score:.2f}`\n"
                 f"Contracts: `{qty}`\n"
                 f"{credit_debit.capitalize()}: `${price:.4f}`\n"
-                f"Risk at entry: `${risk:.2f}`\n"
+                f"Risk at entry: `${risk_amount:.2f}`\n"
                 f"Order: `{order_id}`\n"
                 f"Approval ID: `{approval_id}`"
             )
@@ -335,6 +345,7 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
                     msg += f"\n  • {leg.get('instruction','?')} {leg.get('option_symbol', leg.get('symbol','?'))}"
             await notifier.send_note(msg, parse_mode="Markdown")
         except Exception as e:
+            failed_executions += 1
             log.exception("Auto-execute FAILED for approval %s (%s %s)", approval_id, sym, strat)
             db.set_status(approval_id, "FAILED")
             err_msg = f"⚠️ *TRADE FAILED*\n{sym} {strat} (score {score:.2f}): `{e}`"
@@ -343,12 +354,46 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
             except Exception:
                 pass
 
+    # --- Scan-cycle summary (heartbeat + confirms loop is alive) ---
+    # Daily cap usage
+    day_cap = risk.cfg.get("max_new_trades_per_day")
+    today_iso = date.today().isoformat()
+    approvals_today = db.count_trades_today(today_iso)
+    pending_rows = risk.conn.execute(
+        "SELECT COUNT(*) FROM approvals WHERE status='PENDING' AND created_at LIKE ?",
+        (f"{today_iso}%",),
+    ).fetchone()
+    pending_n = pending_rows[0] if pending_rows else 0
+    total_today = approvals_today + pending_n
+
+    # Open positions count
+    open_rows = risk.conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE status='EXECUTED' AND (outcome='OPEN' OR outcome IS NULL)"
+    ).fetchone()
+    open_positions = open_rows[0] if open_rows else 0
+
+    cap_str = (
+        f"day-cap={total_today}/{day_cap}" if day_cap else f"day-cap={total_today}/∞"
+    )
+
+    dt_ms = int((datetime.now(timezone.utc) - t_start).total_seconds() * 1000)
+    log.info(
+        "SCAN SUMMARY — candidates=%d | gates_passed=%d | executed=%d | failed=%d | open_pos=%d | %s | took %dms",
+        total_candidates, gates_passed, executed_count, failed_executions,
+        open_positions, cap_str, dt_ms,
+    )
+
     mark_event("scan")
 
 
 async def run_exit_check(exit_manager, db, notifier, circuit_breaker, executor=None):
+    triggers = []
+    exits_attempted = 0
+    exits_ok = 0
+    exits_failed = 0
     try:
         if circuit_breaker.is_tripped():
+            log.info("EXIT CHECK — circuit breaker tripped, skipped")
             return
         triggers = exit_manager.check_triggers()
         for trigger in triggers:
@@ -372,11 +417,13 @@ async def run_exit_check(exit_manager, db, notifier, circuit_breaker, executor=N
                 log.error("Executor unavailable — cannot auto-exit trade %s (%s)", trade_id, reason)
                 continue
 
+            exits_attempted += 1
             db.set_status(approval_id, "APPROVED")
             log.info("Auto-exiting trade %s (%s, %s), approval %s", trade_id, sym, reason, approval_id)
             try:
                 order_id = await executor.execute(candidate, approval_id)
                 db.set_status(approval_id, "EXECUTED")
+                exits_ok += 1
                 log.info("Exit OK: trade %s (%s) → order %s", trade_id, reason, order_id)
                 price = candidate.get("est_price") or 0
                 credit_debit = "credit" if candidate.get("is_credit") else "debit"
@@ -391,6 +438,7 @@ async def run_exit_check(exit_manager, db, notifier, circuit_breaker, executor=N
                 )
                 await notifier.send_note(msg, parse_mode="Markdown")
             except Exception as e:
+                exits_failed += 1
                 log.exception("Exit FAILED for trade %s (approval %s)", trade_id, approval_id)
                 db.set_status(approval_id, "FAILED")
                 err = f"❌ *EXIT FAILED*\n{sym} trade `{trade_id}` reason `{reason}`: `{e}`"
@@ -401,6 +449,10 @@ async def run_exit_check(exit_manager, db, notifier, circuit_breaker, executor=N
             continue  # skip the manual approval send (unreachable, belt+suspenders)
 
     finally:
+        log.info(
+            "EXIT CHECK SUMMARY — triggers=%d | attempted=%d | ok=%d | failed=%d",
+            len(triggers), exits_attempted, exits_ok, exits_failed,
+        )
         mark_event("exit_check")
 
 
@@ -429,11 +481,12 @@ async def _run_forever_interval(name: str, seconds: int, coro_fn, *args,
         initial_delay: Sleep this many seconds BEFORE the first call (useful
             to stagger initial tasks so they don't thundering-herd at boot).
     """
+    from datetime import timezone
     log.info("Task %s registered (every %ds, initial_delay=%ds)", name, seconds, initial_delay)
     if initial_delay > 0:
         await asyncio.sleep(initial_delay)
     while True:
-        t0 = datetime.utcnow()
+        t0 = datetime.now(timezone.utc)
         try:
             result = coro_fn(*args)
             if asyncio.iscoroutine(result):
@@ -446,7 +499,8 @@ async def _run_forever_interval(name: str, seconds: int, coro_fn, *args,
             if not suppress_exceptions:
                 raise
         finally:
-            dt_ms = int((datetime.utcnow() - t0).total_seconds() * 1000)
+            dt_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+            log.info("Task %s tick complete — took %dms", name, dt_ms)
             mark_event(name)
         try:
             await asyncio.sleep(seconds)
@@ -463,11 +517,12 @@ async def _run_weekly_cron(name: str, day_of_week: str, hour: int,
     """Simple weekly cron using native asyncio only.
     Fires once per week at the given weekday/hour (with optional UTC offset
     applied so 18:00 'local sun' doesn't require a tz library)."""
+    from datetime import timezone
     target_wd = _WEEKDAY.get((day_of_week or "sun").lower(), 6)
     log.info("Cron %s registered (weekday=%s hour=%d tz_offset=%+dh)",
              name, day_of_week, hour, tz_offset_hours)
     while True:
-        now = datetime.utcnow() + timedelta(hours=tz_offset_hours)
+        now = datetime.now(timezone.utc) + timedelta(hours=tz_offset_hours)
         # Compute next firing time
         days_until = (target_wd - now.weekday()) % 7
         candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
@@ -482,6 +537,7 @@ async def _run_weekly_cron(name: str, day_of_week: str, hour: int,
             log.info("Cron %s cancelled — shutting down cleanly", name)
             return
         # Run it
+        t0 = datetime.now(timezone.utc)
         try:
             result = coro_fn(*args)
             if asyncio.iscoroutine(result):
@@ -491,16 +547,20 @@ async def _run_weekly_cron(name: str, day_of_week: str, hour: int,
             return
         except Exception as e:
             log.exception("Cron %s CRASHED during run: %s", name, e)
+        finally:
+            dt_s = (datetime.now(timezone.utc) - t0).total_seconds()
+            log.info("Cron %s run complete — took %.1fs", name, dt_s)
 
 
 async def _run_daily_cron(name: str, hour: int, minute: int, fn, *args,
                            tz_offset_hours: int = 0):
     """Run a (sync) callable daily at HH:MM with optional UTC offset.
     Used for paper-mode expired-position settlement."""
+    from datetime import timezone
     log.info("Daily cron %s registered (%02d:%02d, tz_offset=%+dh)",
              name, hour, minute, tz_offset_hours)
     while True:
-        now = datetime.utcnow() + timedelta(hours=tz_offset_hours)
+        now = datetime.now(timezone.utc) + timedelta(hours=tz_offset_hours)
         nxt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if nxt <= now:
             nxt += timedelta(days=1)
@@ -510,10 +570,14 @@ async def _run_daily_cron(name: str, hour: int, minute: int, fn, *args,
         except asyncio.CancelledError:
             log.info("Daily cron %s cancelled", name)
             return
+        t0 = datetime.now(timezone.utc)
         try:
             fn(*args)
         except Exception as e:
             log.exception("Daily cron %s CRASHED: %s", name, e)
+        finally:
+            dt_s = (datetime.now(timezone.utc) - t0).total_seconds()
+            log.info("Daily cron %s run complete — took %.1fs", name, dt_s)
 
 
 async def main():

@@ -31,7 +31,7 @@ DEFAULTS = {
     "max_risk_per_trade_pct": 0.02,
     "max_concurrent_positions": 4,
     "max_positions_per_symbol": 1,
-    "max_new_trades_per_day": 5,
+    "max_new_trades_per_day": 10,
     "min_contracts_per_trade": 1,
     "max_contracts_per_trade": 10,
     "min_credit_dollars": 5.0,
@@ -122,9 +122,12 @@ class RiskManager:
         # dedupe here so 20 DOT rejections don't each cause a separate lookup.
         self._spot_cache: dict[str, float | None] = {}
         # First-rejection log dedupe: (symbol, strategy, gate_name) set.
-        # Reset via reset_scan_caches() at the top of each scan cycle
+        # Reset via reset_scan_caches() at the start of each scan cycle
         # (or grows to modest worst-case ~320 entries).
         self._reject_log_seen: set[tuple[str, str, str]] = set()
+        # Per-scan one-time flags for global gates (so we don't spam 40
+        # identical messages). Reset in reset_scan_caches().
+        self._daily_cap_hit_announced: bool = False
         # Greeks-cap configuration (merged from DEFAULTS + cfg override)
         greeks_cfg = {}
         if isinstance(self.cfg.get("portfolio_greeks"), dict):
@@ -194,6 +197,7 @@ class RiskManager:
         first-rejection log dedupe don't carry across scan boundaries."""
         self._spot_cache.clear()
         self._reject_log_seen.clear()
+        self._daily_cap_hit_announced = False
 
     # ---------- portfolio greeks engine ----------
 
@@ -587,6 +591,15 @@ class RiskManager:
             pending_n = pending_rows[0] if pending_rows else 0
             total_today = approvals_today + pending_n
             if total_today >= day_cap:
+                # Announce once per scan (high-level) before the per-symbol rejection
+                if not self._daily_cap_hit_announced:
+                    self._daily_cap_hit_announced = True
+                    log.info(
+                        "DAILY TRADE CAP REACHED: %d/%d actions used today — "
+                        "all remaining candidates this scan will skip execution "
+                        "(resets at midnight local server time).",
+                        total_today, day_cap,
+                    )
                 return _reject(
                     "max_new_trades_today",
                     f"{total_today} total actions today (cap {day_cap})",
