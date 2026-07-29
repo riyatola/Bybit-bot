@@ -9,7 +9,20 @@ import logging
 import os
 import sys
 import yaml
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+
+
+def _utcnow() -> datetime:
+    """Safe UTC-now wrapper. Returns a TZ-aware UTC datetime object
+    using the modern timezone.utc API (Python 3.12+). If for some reason
+    the 'timezone' import is missing in a running interpreter (e.g.
+    partial / half-reloaded code during Render deploy) the function
+    falls back to the legacy (deprecated but still functional)
+    datetime.utcnow() so scans don't crash."""
+    try:
+        return datetime.now(timezone.utc)
+    except NameError:
+        return datetime.utcnow()  # type: ignore[attr-defined]
 
 from bybit_client import BybitClient, _format_api_error
 from market_data import MarketDataAdapter
@@ -201,12 +214,11 @@ def get_universe(cfg):
 async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notifier,
                          guardrails, learning, bybit_alpha, sentiment, circuit_breaker,
                          executor=None):
-    from datetime import timezone
     db.expire_stale()
     if hasattr(risk, "reset_scan_caches"):
         risk.reset_scan_caches()
 
-    t_start = datetime.now(timezone.utc)
+    t_start = _utcnow()
 
     if circuit_breaker.is_tripped():
         log.warning("Circuit breaker tripped, skipping scan")
@@ -376,7 +388,7 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
         f"day-cap={total_today}/{day_cap}" if day_cap else f"day-cap={total_today}/∞"
     )
 
-    dt_ms = int((datetime.now(timezone.utc) - t_start).total_seconds() * 1000)
+    dt_ms = int((_utcnow() - t_start).total_seconds() * 1000)
     log.info(
         "SCAN SUMMARY — candidates=%d | gates_passed=%d | executed=%d | failed=%d | open_pos=%d | %s | took %dms",
         total_candidates, gates_passed, executed_count, failed_executions,
@@ -481,12 +493,11 @@ async def _run_forever_interval(name: str, seconds: int, coro_fn, *args,
         initial_delay: Sleep this many seconds BEFORE the first call (useful
             to stagger initial tasks so they don't thundering-herd at boot).
     """
-    from datetime import timezone
     log.info("Task %s registered (every %ds, initial_delay=%ds)", name, seconds, initial_delay)
     if initial_delay > 0:
         await asyncio.sleep(initial_delay)
     while True:
-        t0 = datetime.now(timezone.utc)
+        t0 = _utcnow()
         try:
             result = coro_fn(*args)
             if asyncio.iscoroutine(result):
@@ -499,7 +510,7 @@ async def _run_forever_interval(name: str, seconds: int, coro_fn, *args,
             if not suppress_exceptions:
                 raise
         finally:
-            dt_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+            dt_ms = int((_utcnow() - t0).total_seconds() * 1000)
             log.info("Task %s tick complete — took %dms", name, dt_ms)
             mark_event(name)
         try:
@@ -517,12 +528,11 @@ async def _run_weekly_cron(name: str, day_of_week: str, hour: int,
     """Simple weekly cron using native asyncio only.
     Fires once per week at the given weekday/hour (with optional UTC offset
     applied so 18:00 'local sun' doesn't require a tz library)."""
-    from datetime import timezone
     target_wd = _WEEKDAY.get((day_of_week or "sun").lower(), 6)
     log.info("Cron %s registered (weekday=%s hour=%d tz_offset=%+dh)",
              name, day_of_week, hour, tz_offset_hours)
     while True:
-        now = datetime.now(timezone.utc) + timedelta(hours=tz_offset_hours)
+        now = _utcnow() + timedelta(hours=tz_offset_hours)
         # Compute next firing time
         days_until = (target_wd - now.weekday()) % 7
         candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
@@ -537,7 +547,7 @@ async def _run_weekly_cron(name: str, day_of_week: str, hour: int,
             log.info("Cron %s cancelled — shutting down cleanly", name)
             return
         # Run it
-        t0 = datetime.now(timezone.utc)
+        t0 = _utcnow()
         try:
             result = coro_fn(*args)
             if asyncio.iscoroutine(result):
@@ -548,7 +558,7 @@ async def _run_weekly_cron(name: str, day_of_week: str, hour: int,
         except Exception as e:
             log.exception("Cron %s CRASHED during run: %s", name, e)
         finally:
-            dt_s = (datetime.now(timezone.utc) - t0).total_seconds()
+            dt_s = (_utcnow() - t0).total_seconds()
             log.info("Cron %s run complete — took %.1fs", name, dt_s)
 
 
@@ -556,11 +566,10 @@ async def _run_daily_cron(name: str, hour: int, minute: int, fn, *args,
                            tz_offset_hours: int = 0):
     """Run a (sync) callable daily at HH:MM with optional UTC offset.
     Used for paper-mode expired-position settlement."""
-    from datetime import timezone
     log.info("Daily cron %s registered (%02d:%02d, tz_offset=%+dh)",
              name, hour, minute, tz_offset_hours)
     while True:
-        now = datetime.now(timezone.utc) + timedelta(hours=tz_offset_hours)
+        now = _utcnow() + timedelta(hours=tz_offset_hours)
         nxt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if nxt <= now:
             nxt += timedelta(days=1)
@@ -570,13 +579,13 @@ async def _run_daily_cron(name: str, hour: int, minute: int, fn, *args,
         except asyncio.CancelledError:
             log.info("Daily cron %s cancelled", name)
             return
-        t0 = datetime.now(timezone.utc)
+        t0 = _utcnow()
         try:
             fn(*args)
         except Exception as e:
             log.exception("Daily cron %s CRASHED: %s", name, e)
         finally:
-            dt_s = (datetime.now(timezone.utc) - t0).total_seconds()
+            dt_s = (_utcnow() - t0).total_seconds()
             log.info("Daily cron %s run complete — took %.1fs", name, dt_s)
 
 

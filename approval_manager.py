@@ -39,6 +39,19 @@ CREATE TABLE IF NOT EXISTS trades (
 """
 
 
+def _utcnow() -> datetime:
+    """Return timezone-aware UTC now (Python 3.12+), with a safe fallback
+    to the deprecated datetime.utcnow() if 'timezone' is unavailable in
+    the running interpreter (prevents scan crashes on hot-reload/partial
+    code push scenarios where the import hasn't propagated yet)."""
+    try:
+        return datetime.now(timezone.utc)
+    except NameError:
+        # Fallback: utcnow() returns naive UTC datetime; serializing as
+        # ISO works fine (we only compare / prefix-match ISO strings).
+        return datetime.utcnow()  # type: ignore[attr-defined]
+
+
 def _normalize_turso_url_and_token(url: str):
     """Accepts libsql://..., https://..., http://... URLs.
     Returns (https_base_url, auth_token). Auth token can come from
@@ -331,7 +344,7 @@ class Db:
 
     def create_approval(self, candidate: dict, timeout_minutes: int) -> str:
         approval_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = _utcnow()
         expires = now + timedelta(minutes=timeout_minutes)
         self.conn.execute(
             "INSERT INTO approvals (id, symbol, strategy, candidate_json, created_at, expires_at) "
@@ -357,12 +370,12 @@ class Db:
     def set_status(self, approval_id: str, status: str):
         self.conn.execute(
             "UPDATE approvals SET status=?, decided_at=? WHERE id=?",
-            (status, datetime.now(timezone.utc).isoformat(), approval_id),
+            (status, _utcnow().isoformat(), approval_id),
         )
         self.conn.commit()
 
     def expire_stale(self):
-        now = datetime.now(timezone.utc).isoformat()
+        now = _utcnow().isoformat()
         cur = self.conn.execute(
             "UPDATE approvals SET status='EXPIRED' WHERE status='PENDING' AND expires_at < ?",
             (now,),
@@ -389,7 +402,7 @@ class Db:
             "INSERT INTO trades (id, approval_id, symbol, strategy, order_json, order_id, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (trade_id, approval_id, symbol, strategy, json.dumps(order_json), order_id_val,
-             status, datetime.now(timezone.utc).isoformat()),
+             status, _utcnow().isoformat()),
         )
         self.conn.commit()
         return trade_id
