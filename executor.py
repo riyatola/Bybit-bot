@@ -76,12 +76,16 @@ class Executor:
             self.db.record_trade(approval_id, candidate["symbol"], strategy, payload, None, "FAILED")
             raise RuntimeError(f"Order rejected by broker: {resp.status_code} {resp.text}")
 
-        # Paper broker returns order id in body; live adapters should mirror
-        # that — parse header Location as a fallback, just in case.
-        order_url = resp.headers.get("Location", "")
-        order_id = order_url.rsplit("/", 1)[-1] if order_url else (
-            getattr(resp, "body", {}).get("id") if hasattr(resp, "body") else "unknown"
-        )
+        # Prefer the native body.order_id returned by Bybit + paper broker;
+        # fall back to the <order id> tail of the Location header just in case
+        # a live adapter uses that (e.g. the original Schwab shape).
+        body_obj = resp.json() if callable(getattr(resp, "json", None)) else {}
+        order_id = None
+        if isinstance(body_obj, dict):
+            order_id = body_obj.get("order_id") or body_obj.get("id") or body_obj.get("orderId")
+        if not order_id:
+            order_url = resp.headers.get("Location", "")
+            order_id = order_url.rsplit("/", 1)[-1] if order_url else "unknown"
         trade_id = self.db.record_trade(approval_id, candidate["symbol"], strategy, payload, order_id, "SUBMITTED")
 
         if self.trade_tracker and not candidate.get("trigger_type"):

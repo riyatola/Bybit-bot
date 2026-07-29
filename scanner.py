@@ -607,14 +607,51 @@ async def main():
     log.info("Health server will bind to 0.0.0.0:%d (PORT=%s)",
              get_port(), os.environ.get("PORT"))
 
-    # Paper wrapper if mode is paper
-    if cfg.get("mode", "paper") == "paper":
-        client = PaperBrokerClient(real_client, cfg)
-        account_hash = "PAPER0"  # paper broker uses fixed hash
+    # Choose broker:
+    #   - BOT_PURE_PAPER=1  → pure in-memory Python paper broker, zero Bybit calls on writes.
+    #   - mode="paper" (the default, env config) → Bybit Testnet trading IF the API
+    #     keys are set. Orders, positions, and P&L all appear inside the real Bybit
+    #     Testnet web/mobile "Positions / Orders / Assets" UI, so you can visually
+    #     follow the bot without real-money risk.
+    #   - mode="live" → Bybit mainnet with real credentials.
+    force_pure_paper_env = os.environ.get("BOT_PURE_PAPER", "").strip().lower() in {"1", "true", "yes"}
+    mode_name = cfg.get("mode", "paper")
+    use_pure_python_paper = force_pure_paper_env
+    if not use_pure_python_paper:
+        has_bybit_keys = bool(bybit_cfg.get("api_key")) and bool(bybit_cfg.get("api_secret"))
+        testnet_on = bybit_cfg.get("testnet", True)
+        if mode_name == "paper" and has_bybit_keys and testnet_on:
+            log.info(
+                "Paper-mode routing to BYBIT TESTNET for fills (UI-visible trades). "
+                "Set BOT_PURE_PAPER=1 to use the isolated in-memory paper broker instead."
+            )
+            log.info(
+                "Bybit Testnet setup checklist: (1) Upgrade to Unified Trading Account (UTA) "
+                "at https://testnet.bybit.com/app/user/overview ; (2) claim free USDC/USDT "
+                "from the Testnet Asset Hub Faucet at https://testnet.bybit.com/app/user/wallet/asset-hub "
+                "(options settle in USDC); (3) only symbols Bybit actually lists in testnet "
+                "options (BTC, ETH typically) will fill — altcoins may be rejected with "
+                "'symbol not exist' until mainnet."
+            )
+            client = real_client
+            account_hash = "BYBIT-TESTNET"
+        elif mode_name == "live":
+            client = real_client
+            account_hash = "BYBIT-LIVE"
+            if testnet_on:
+                log.warning("mode=live but bybit.testnet=true — double-check config if trades should be mainnet.")
+        else:
+            log.info(
+                "Using in-memory paper broker (pure Python). Trades will NOT appear in Bybit UI. "
+                "To route to Bybit Testnet UI: set BYBIT_API_KEY + BYBIT_API_SECRET (testnet keys) "
+                "and keep testnet=true, with BOT_PURE_PAPER=0/unset."
+            )
+            client = PaperBrokerClient(real_client, cfg)
+            account_hash = "PAPER0"
     else:
-        client = real_client
-        # For real, we need an account hash – Bybit uses account ID? We'll use a dummy for now.
-        account_hash = "REAL_ACCOUNT"  # placeholder; adapt as needed
+        log.info("BOT_PURE_PAPER=1 set — using isolated in-memory paper broker (no Bybit write calls).")
+        client = PaperBrokerClient(real_client, cfg)
+        account_hash = "PAPER0"
 
     try:
         real_client.account_info()

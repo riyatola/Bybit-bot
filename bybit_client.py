@@ -1,17 +1,19 @@
 """
-Bybit client adapter: wraps Bybit's REST API with a Schwab-shaped
-interface so executor.py / trade_tracker.py / scanner.py can call it
-without being rewritten.
+Bybit client adapter: wraps pybit.unified_trading.HTTP and exposes the
+broker-neutral call shape used by executor.py / trade_tracker.py /
+scanner.py:
 
-Schwab-shaped calls we implement:
   client.place_order(account_hash, payload)     -> resp{status_code, headers{Location}, text, json()}
   client.account_details(hash, fields="positions") -> resp{raise_for_status, json()["securitiesAccount"]}
   client.transactions(hash, symbol, types)      -> resp{raise_for_status, json()[transactions with netAmount]}
-  client.account_info()                         -> info or raises
+  client.account_info()                         -> raises on bad auth, returns wallet balance dict
+  client.get_option_chain_bybit(...)            -> raw Bybit instrument list
+  client.get_option_tickers / get_linear_tickers / get_linear_ticker -> market-data helpers
 
-The real Bybit SDK (pybit) is used when installed. Everything degrades
-gracefully if pybit isn't installed yet (raises on calls that would
-touch the network, same as if auth failed).
+Errors from Bybit v5 are translated to human hints via _format_api_error
+and _bybit_order_error_hint. If pybit is not installed, the adapter
+degrades gracefully on reads (returns empty list/tickers) and raises on
+writes (place_order).
 """
 
 import json
@@ -79,7 +81,7 @@ class _FakeResponse:
 
 
 class BybitClient:
-    """Thin adapter: accepts Schwab-shaped payloads, translates to Bybit REST calls."""
+    """Thin adapter: accepts broker-neutral order payloads, translates to Bybit v5 REST calls."""
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
         self.api_key = api_key
@@ -114,7 +116,8 @@ class BybitClient:
             raise RuntimeError(msg) from e
 
     def account_details(self, account_hash: str, fields: str = "positions") -> _FakeResponse:
-        """Schwab-compatible: returns json()['securitiesAccount']['positions']."""
+        """Broker-neutral: returns json()['securitiesAccount']['positions'] in a shape
+        downstream code (scanner, trade_tracker, exits) can read without knowing Bybit."""
         positions = []
         balances = {"cash_available": 0.0, "net_liq": 0.0}
 
@@ -194,33 +197,44 @@ class BybitClient:
 
     # ---------------- orders ----------------
 
-    def place_order(self, account_hash: str, schwab_payload: dict) -> _FakeResponse:
+    def place_order(self, account_hash: str, payload: dict) -> _FakeResponse:
         """
-        Accepts a Schwab-shaped order payload:
+        Accepts a broker-neutral order payload:
           {orderType: NET_CREDIT|NET_DEBIT|LIMIT|MARKET,
            orderStrategyType: SINGLE,
            price: str,
            orderLegCollection: [{instruction, quantity, instrument{symbol, assetType}}]}
 
-        Translates each leg to a Bybit order (category=option or linear). The
-        PaperBroker bypasses this method entirely, so we only translate for
-        real-money live trading.
+        Translates each leg to a Bybit order (category=option or linear). For
+        close legs (BUY_TO_CLOSE, SELL_TO_CLOSE) we set reduceOnly=True so
+        they don't accidentally open new positions. Each leg is sent
+        sequentially; if leg N fails the prior (N-1) legs are NOT auto-
+        cancelled (Bybit options don't support combo/bag orders atomically),
+        but the returned status_code is 500 so the caller marks FAILED.
         """
-        legs = schwab_payload.get("orderLegCollection", [])
+        legs = payload.get("orderLegCollection", [])
         if not legs:
             return _FakeResponse(400, body={"error": "empty orderLegCollection"})
 
-        order_ids = []
+        order_ids: list[str] = []
+        errors: list[str] = []
         last_status = 201
-        for leg in legs:
+        for idx, leg in enumerate(legs):
             instr = leg.get("instrument", {})
             symbol = instr.get("symbol", "")
             asset_type = instr.get("assetType", "OPTION").upper()
-            qty = int(leg.get("quantity", 0))
-            if qty <= 0:
+            raw_qty = leg.get("quantity", 0)
+            try:
+                qty_num = int(raw_qty) if asset_type == "OPTION" else float(raw_qty)
+            except (TypeError, ValueError):
+                errors.append(f"leg[{idx}] bad qty={raw_qty!r}")
+                last_status = 400
+                break
+            if qty_num <= 0:
                 continue
             instruction = leg.get("instruction", "BUY_TO_OPEN")
             side = self._translate_side(instruction)
+            is_close = "CLOSE" in instruction.upper()
 
             if asset_type == "CRYPTO":
                 category = "linear"
@@ -229,13 +243,13 @@ class BybitClient:
             else:
                 category = "option"
 
-            order_type = self._translate_order_type(schwab_payload.get("orderType", ""))
+            order_type = self._translate_order_type(payload.get("orderType", ""))
             price = None
             if order_type != "Market":
-                price_str = schwab_payload.get("price")
+                price_str = payload.get("price")
                 if price_str:
                     try:
-                        price = f"{float(price_str):.4f}"
+                        price = f"{float(price_str):.6f}".rstrip("0").rstrip(".")
                     except ValueError:
                         price = None
 
@@ -244,26 +258,57 @@ class BybitClient:
                 "symbol": symbol,
                 "side": side,
                 "orderType": order_type,
-                "qty": str(qty),
+                "qty": str(qty_num),
             }
             if price:
                 params["price"] = price
-            if category == "option":
-                params.setdefault("orderFilter", "Order")
+            if order_type == "Limit":
+                params["timeInForce"] = "GTC"
+            if is_close:
+                params["reduceOnly"] = True
+            if category == "linear":
+                params.setdefault("positionIdx", 0)  # one-way mode for perps
 
             if not self._session:
-                order_id = f"SIM-{uuid.uuid4().hex[:12]}"
-                order_ids.append(order_id)
-                continue
+                if _HAS_PYBIT:
+                    err = "pybit session not initialized — check API key/secret or testnet flag."
+                else:
+                    err = "pybit not installed. Install with: pip install pybit"
+                errors.append(err)
+                return _FakeResponse(503, body={"error": err})
 
             try:
                 resp = self._session.place_order(**params)
-                oid = resp.get("result", {}).get("orderId", f"BYBIT-{uuid.uuid4().hex[:8]}")
+                ret_code = resp.get("retCode", -1) if isinstance(resp, dict) else -1
+                if ret_code != 0:
+                    ret_msg = resp.get("retMsg", "unknown retCode != 0") if isinstance(resp, dict) else str(resp)
+                    hint = self._bybit_order_error_hint(ret_msg, params)
+                    errors.append(f"leg[{idx}] {symbol} Bybit rejected: retCode={ret_code} retMsg={ret_msg}{hint}")
+                    last_status = 500
+                    break
+                oid = None
+                if isinstance(resp, dict):
+                    oid = (resp.get("result") or {}).get("orderId")
+                if not oid:
+                    oid = f"BYBIT-{uuid.uuid4().hex[:8]}"
                 order_ids.append(oid)
             except Exception as e:
-                log.error("place_order leg failed (%s): %s", symbol, e)
+                msg = _format_api_error(e, testnet=self.testnet)
+                errors.append(f"leg[{idx}] {symbol} exception: {msg}")
                 last_status = 500
                 break
+
+        if errors:
+            combined = "; ".join(errors)
+            log.error("place_order finished with errors: %s", combined)
+            body: dict = {"error": combined, "legs": order_ids}
+            if order_ids:
+                body["partial_order_ids"] = order_ids
+                body["warning"] = (
+                    "One or more legs failed after prior legs submitted. "
+                    "Partially-filled legs are still live — cancel manually in Bybit UI if needed."
+                )
+            return _FakeResponse(status_code=last_status, body=body, text=combined)
 
         order_id = order_ids[0] if order_ids else f"UNKNOWN-{uuid.uuid4().hex[:6]}"
         body = {"order_id": order_id, "legs": order_ids}
@@ -273,12 +318,43 @@ class BybitClient:
             headers={"Location": f"/bybit/orders/{order_id}"},
         )
 
+    @staticmethod
+    def _bybit_order_error_hint(ret_msg: str, params: dict) -> str:
+        """Append human-readable setup hints for common Bybit v5 errors."""
+        low = (ret_msg or "").lower()
+        symbol = params.get("symbol", "")
+        cat = params.get("category", "")
+        hints = []
+        if "unified" in low or "uta" in low or "upgrade" in low:
+            hints.append(
+                " HINT: Log into the Bybit Testnet web/mobile app and tap "
+                "'Upgrade to Unified Trading Account (UTA)' under Assets. "
+                "Derivatives and options only work inside UTA."
+            )
+        if "insufficient" in low or "margin" in low or "balance" in low:
+            hints.append(
+                " HINT: Deposit testnet USDC/USDT into the Unified wallet on "
+                "Bybit Testnet. Options settle in USDC; go to the Testnet Asset "
+                "Hub 'Faucet' to claim free testnet coins."
+            )
+        if "symbol" in low and ("invalid" in low or "exist" in low):
+            hints.append(
+                f" HINT: Bybit {cat} may not list symbol='{symbol}'. On testnet "
+                "only BTC/ETH typically have option chains; altcoins (AVAX, ADA, "
+                "SOL) may need mainnet UTA or the symbol format has changed (check "
+                "strike precision, expiry case)."
+            )
+        if "orderfilter" in low:
+            hints.append(" HINT: remove orderFilter from options order params.")
+        return "".join(hints)
+
     # ---------------- transactions (for trade_tracker outcome polling) ----------------
 
     def transactions(self, account_hash: str, symbol: str | None = None,
                      types: str = "TRADE", start_date: str | None = None,
                      end_date: str | None = None) -> _FakeResponse:
-        """Schwab-compatible: returns a list of transactions with a netAmount field."""
+        """Broker-neutral: returns a list of transactions with a netAmount field
+        (used by trade_tracker / learning to detect settled realized P&L)."""
         txns: list[dict] = []
 
         if self._session:
@@ -404,7 +480,7 @@ class BybitClient:
 
     @staticmethod
     def _translate_side(instruction: str) -> str:
-        """Schwab instructions -> Bybit side.
+        """Broker-neutral BUY_*/SELL_* instructions -> Bybit side strings.
         BUY_TO_OPEN / BUY_TO_CLOSE  -> Buy
         SELL_TO_OPEN / SELL_TO_CLOSE -> Sell"""
         upper = instruction.upper()
@@ -415,9 +491,9 @@ class BybitClient:
         return "Buy" if "BUY" in upper else "Sell"
 
     @staticmethod
-    def _translate_order_type(schwab_order_type: str) -> str:
-        """Schwab NET_CREDIT/NET_DEBIT/LIMIT -> Bybit Limit/Market."""
-        ot = (schwab_order_type or "").upper()
+    def _translate_order_type(order_type: str) -> str:
+        """Broker-neutral NET_CREDIT/NET_DEBIT/LIMIT/MARKET -> Bybit Limit/Market."""
+        ot = (order_type or "").upper()
         if ot in ("MARKET",):
             return "Market"
         return "Limit"

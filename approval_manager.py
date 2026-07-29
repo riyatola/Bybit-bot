@@ -10,7 +10,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 log = logging.getLogger("approval")
 
@@ -289,6 +289,45 @@ class Db:
         self.conn = _connect(path)
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self._migrate_schema()
+        self.conn.commit()
+
+    def _migrate_schema(self):
+        """Run idempotent schema upgrades:
+        - v1 → v2: trades.schwab_order_id (legacy Schwab naming) copied to
+          trades.order_id, then the old column is left in place for any
+          downstream code that may still read it.
+        Done as a best-effort try/catch because SQLite's ADD COLUMN on
+        existing tables can throw if the column already exists (we swallow
+        only that specific error class)."""
+        from sqlite3 import OperationalError
+        try:
+            # 1. Add order_id column if it doesn't exist yet (legacy DBs
+            #    created before the Bybit rename will be missing it).
+            try:
+                self.conn.execute(
+                    "ALTER TABLE trades ADD COLUMN order_id TEXT"
+                )
+            except OperationalError as e:
+                if "duplicate column" not in str(e).lower() and "already exists" not in str(e).lower():
+                    raise
+            # 2. Back-fill any order_id that is NULL from the legacy column
+            #    if present, so old SUBMITTED rows keep their PAPER-0000… id.
+            cols = [row[1] for row in self.conn.execute("PRAGMA table_info(trades)").fetchall()]
+            if "schwab_order_id" in cols and "order_id" in cols:
+                cur = self.conn.execute(
+                    "UPDATE trades SET order_id = schwab_order_id "
+                    "WHERE order_id IS NULL AND schwab_order_id IS NOT NULL"
+                )
+                if getattr(cur, "rowcount", 0) and cur.rowcount > 0:
+                    log.info(
+                        "Schema migration: copied order_id from schwab_order_id "
+                        "for %d legacy trade rows.", cur.rowcount
+                    )
+        except Exception as e:
+            log.warning(
+                "Schema migration in approval_manager.Db skipped (non-fatal): %s", e
+            )
 
     def create_approval(self, candidate: dict, timeout_minutes: int) -> str:
         approval_id = str(uuid.uuid4())
