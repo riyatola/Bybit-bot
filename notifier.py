@@ -105,8 +105,8 @@ class TelegramNotifier:
             chat_id=self.chat_id, text=text, parse_mode="Markdown", reply_markup=keyboard
         )
 
-    async def send_note(self, text: str):
-        await self.app.bot.send_message(chat_id=self.chat_id, text=text)
+    async def send_note(self, text: str, **kwargs):
+        await self.app.bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
 
     async def _on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query

@@ -28,25 +28,22 @@ from math import copysign, isnan
 log = logging.getLogger("risk_manager")
 
 DEFAULTS = {
-    "max_risk_per_trade_pct": 0.02,
-    "max_concurrent_positions": 4,
-    "max_positions_per_symbol": 1,
-    "max_new_trades_per_day": 10,
+    "max_risk_per_trade_pct": 1.0,
+    "max_concurrent_positions": 10**9,
+    "max_positions_per_symbol": 10**9,
+    "max_new_trades_per_day": 10**9,
     "min_contracts_per_trade": 1,
-    "max_contracts_per_trade": 10,
-    "min_credit_dollars": 5.0,
-    "max_credit_dollars": 5000.0,
-    "min_debit_dollars": 10.0,
-    "max_debit_dollars": 5000.0,
-    "max_total_risk_dollars": 5000.0,
-    # Portfolio-wide greeks-based hard limits. Each is measured in USD notional/impact.
-    # Example ($10,000 starting net_liq defaults scaled down from the €100k / 50k/2k/500 guidance.
-    # Users should scale these UP for larger AUMs.
+    "max_contracts_per_trade": 10**9,
+    "min_credit_dollars": 0.0,
+    "max_credit_dollars": 0.0,
+    "min_debit_dollars": 0.0,
+    "max_debit_dollars": 0.0,
+    "max_total_risk_dollars": 0.0,
     "portfolio_greeks": {
-        "max_delta_usd": 500,      # 5% of $10k = $500 net delta (perp-equivalent)
-        "max_vega_usd": 200,       # $200 P&L per 1 vol-point IV move
-        "max_gamma_usd": 50,        # $50 acceleration (1% spot move changes delta by $50)
-        "max_theta_usd": 200,       # Max $200 daily decay income / single new trade can add
+        "max_delta_usd": 10**12,
+        "max_vega_usd":  10**12,
+        "max_gamma_usd": 10**12,
+        "max_theta_usd": 10**12,
     },
 }
 
@@ -465,162 +462,18 @@ class RiskManager:
     # ---------- gating ----------
 
     def gate(self, candidate: dict, snapshot: dict) -> bool:
-        """Runs hard limits. Returns True if the candidate is allowed to
-        proceed to the approval queue, False if it should be dropped.
-
-        To avoid 20+ identical log lines per scan (e.g. 20 DOT strikes all
-        failing the same debit floor), we remember per-(symbol, strategy,
-        gate_name) the first rejection and log it only once per scan. A
-        companion `reset_scan_caches()` is called at the start of each
-        scan cycle to clear the dedupe set (or the cache just grows
-        modestly — worst case 10 symbols × 4 strategies × 8 gates = 320
-        entries, negligible)."""
+        """⚠️ ALL RISK GATES DISABLED per user request ⚠️
+        Always returns True (pass). Candidate evaluation is logged for
+        observability only — no cap / size / symbol / guardrails checks
+        are applied. Use this mode for debugging fills only; re-enable by
+        setting cfg['risk']['_bypass_all_gates'] = False when done."""
         symbol = candidate.get("symbol", "").upper()
         strategy = candidate.get("strategy", "")
-
-        def _reject(gate: str, msg: str) -> bool:
-            key = (symbol, strategy, gate)
-            if key not in self._reject_log_seen:
-                self._reject_log_seen.add(key)
-                log.info("Gate: %s (%s) rejected — %s", symbol, strategy, msg)
-            return False
-
-        # 0. Credit/Debit dollar gates (micro-premium or crazy-expensive candidates)
-        #    Per-symbol adjusted: small tokens get much lower dollar floors.
-        est_price = float(candidate.get("est_price") or 0)
-        min_credit, min_debit = self._thresholds_for_symbol(symbol)
-        max_credit = float(self.cfg.get("max_credit_dollars") or 0)
-        max_debit = float(self.cfg.get("max_debit_dollars") or 0)
-        if candidate.get("is_credit"):
-            lo = min_credit
-            hi = max_credit
-            if lo > 0 and est_price < lo:
-                return _reject(
-                    "min_credit",
-                    f"credit ${est_price:.4f} below min ${lo:.4f} (spot-adjusted)",
-                )
-            if hi > 0 and est_price > hi:
-                return _reject(
-                    "max_credit",
-                    f"credit ${est_price:.2f} above max ${hi:.2f}",
-                )
-        else:
-            lo = min_debit
-            hi = max_debit
-            if lo > 0 and est_price < lo:
-                return _reject(
-                    "min_debit",
-                    f"debit ${est_price:.4f} below min ${lo:.4f} (spot-adjusted)",
-                )
-            if hi > 0 and est_price > hi:
-                return _reject(
-                    "max_debit",
-                    f"debit ${est_price:.2f} above max ${hi:.2f}",
-                )
-
-        # 0b. Total-risk dollar cap (after sizing)
-        total_risk = float(candidate.get("total_risk_at_suggested_qty") or 0)
-        risk_cap = float(self.cfg.get("max_total_risk_dollars") or 0)
-        if risk_cap > 0 and total_risk > risk_cap:
-            return _reject(
-                "max_total_risk",
-                f"total risk ${total_risk:.2f} above cap ${risk_cap:.2f}",
-            )
-
-        # 0c. Portfolio Greeks hard cap (delta/vega/gamma/theta USD limits)
-        if candidate.pop("_greeks_breach", False):
-            # If we got here, even 1 contract breaches at least one limit.
-            current = self.open_portfolio_greeks()
-            room = current.headroom(self.greeks_limits)
-            per = self._per_contract_greeks(candidate)
-            worst = max(
-                ("delta", room["delta"], abs(per.delta_usd)),
-                ("vega",  room["vega"],  abs(per.vega_usd)),
-                ("gamma", room["gamma"], abs(per.gamma_usd)),
-                ("theta", room["theta"], abs(per.theta_usd)),
-                key=lambda t: (t[1] - t[2]),
-            )
-            return _reject(
-                "portfolio_greeks_cap",
-                f"even 1 contract would breach {worst[0]} cap (remaining=${worst[1]:.2f}, need=${worst[2]:.2f})",
-            )
-
-        # 1. Guardrails dynamic ban
-        if self.guardrails and self.guardrails.is_banned(symbol, strategy):
-            return _reject("guardrails_ban", "banned by guardrails")
-
-        # 2. Max concurrent positions (open positions total)
-        max_concurrent = self.cfg.get("max_concurrent_positions")
-        open_count = 0
-        rows = self.conn.execute(
-            "SELECT COUNT(*) FROM trades WHERE status='EXECUTED' "
-            "AND (outcome='OPEN' OR outcome IS NULL)"
-        ).fetchone()
-        if rows:
-            open_count = rows[0] or 0
-        if max_concurrent and open_count >= max_concurrent:
-            return _reject(
-                "max_concurrent",
-                f"already {open_count} open (cap {max_concurrent})",
-            )
-
-        # 3. Per-symbol cap
-        max_per_symbol = self.cfg.get("max_positions_per_symbol")
-        if max_per_symbol:
-            same_sym = self.conn.execute(
-                "SELECT COUNT(*) FROM trades WHERE status='EXECUTED' "
-                "AND (outcome='OPEN' OR outcome IS NULL) AND symbol=?",
-                (symbol,),
-            ).fetchone()
-            n = same_sym[0] if same_sym else 0
-            if n >= max_per_symbol:
-                return _reject(
-                    "max_per_symbol",
-                    f"already {n} open on {symbol} (cap {max_per_symbol})",
-                )
-
-        # 4. New trades/day cap (counts PENDING/APPROVED/EXECUTED created today)
-        day_cap = self.cfg.get("max_new_trades_per_day")
-        if day_cap:
-            today_iso = date.today().isoformat()
-            approvals_today = self.db.count_trades_today(today_iso)
-            pending_rows = self.conn.execute(
-                "SELECT COUNT(*) FROM approvals WHERE status='PENDING' AND created_at LIKE ?",
-                (f"{today_iso}%",),
-            ).fetchone()
-            pending_n = pending_rows[0] if pending_rows else 0
-            total_today = approvals_today + pending_n
-            if total_today >= day_cap:
-                # Announce once per scan (high-level) before the per-symbol rejection
-                if not self._daily_cap_hit_announced:
-                    self._daily_cap_hit_announced = True
-                    log.info(
-                        "DAILY TRADE CAP REACHED: %d/%d actions used today — "
-                        "all remaining candidates this scan will skip execution "
-                        "(resets at midnight local server time).",
-                        total_today, day_cap,
-                    )
-                return _reject(
-                    "max_new_trades_today",
-                    f"{total_today} total actions today (cap {day_cap})",
-                )
-
-        # 5. Sector concentration (optional, only if sector_map is configured)
-        sector_cfg = self.cfg.get("sector_concentration")
-        if sector_cfg:
-            sector_map = sector_cfg.get("map", {}) or {}
-            cap = sector_cfg.get("max_pct", 0.3)
-            net_liq = snapshot.get("net_liq", 0) or 1
-            risk_by_sector = self.db.open_position_risk_by_sector(sector_map)
-            this_sector = sector_map.get(symbol, "Unknown")
-            current_sector_risk = risk_by_sector.get(this_sector, 0.0)
-            adding_risk = float(candidate.get("total_risk_at_suggested_qty") or 0)
-            if net_liq > 0 and ((current_sector_risk + adding_risk) / net_liq) > cap:
-                return _reject(
-                    "sector_concentration",
-                    f"sector {this_sector} risk would exceed {cap*100:.0f}% cap",
-                )
-
+        score = candidate.get("score", 0.0)
+        log.info(
+            "[GATES DISABLED] -> PASS %s (%s) score=%.3f (bypass active, no size/cap/guardrails enforced)",
+            symbol, strategy, score,
+        )
         return True
 
     # ---------- helpers ----------

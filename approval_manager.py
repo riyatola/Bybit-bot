@@ -343,8 +343,9 @@ class Db:
             )
 
     def create_approval(self, candidate: dict, timeout_minutes: int) -> str:
+        from datetime import timezone as _tz_local
         approval_id = str(uuid.uuid4())
-        now = _utcnow()
+        now = datetime.now(_tz_local.utc)
         expires = now + timedelta(minutes=timeout_minutes)
         self.conn.execute(
             "INSERT INTO approvals (id, symbol, strategy, candidate_json, created_at, expires_at) "
@@ -368,14 +369,16 @@ class Db:
         }
 
     def set_status(self, approval_id: str, status: str):
+        from datetime import timezone as _tz_local
         self.conn.execute(
             "UPDATE approvals SET status=?, decided_at=? WHERE id=?",
-            (status, _utcnow().isoformat(), approval_id),
+            (status, datetime.now(_tz_local.utc).isoformat(), approval_id),
         )
         self.conn.commit()
 
     def expire_stale(self):
-        now = _utcnow().isoformat()
+        from datetime import timezone as _tz_local
+        now = datetime.now(_tz_local.utc).isoformat()
         cur = self.conn.execute(
             "UPDATE approvals SET status='EXPIRED' WHERE status='PENDING' AND expires_at < ?",
             (now,),
@@ -397,12 +400,13 @@ class Db:
         return row[0] if row else 0
 
     def record_trade(self, approval_id, symbol, strategy, order_json, order_id_val, status):
+        from datetime import timezone as _tz_local
         trade_id = str(uuid.uuid4())
         self.conn.execute(
             "INSERT INTO trades (id, approval_id, symbol, strategy, order_json, order_id, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (trade_id, approval_id, symbol, strategy, json.dumps(order_json), order_id_val,
-             status, _utcnow().isoformat()),
+             status, datetime.now(_tz_local.utc).isoformat()),
         )
         self.conn.commit()
         return trade_id

@@ -13,16 +13,19 @@ from datetime import date, datetime, timedelta, timezone
 
 
 def _utcnow() -> datetime:
-    """Safe UTC-now wrapper. Returns a TZ-aware UTC datetime object
-    using the modern timezone.utc API (Python 3.12+). If for some reason
-    the 'timezone' import is missing in a running interpreter (e.g.
-    partial / half-reloaded code during Render deploy) the function
-    falls back to the legacy (deprecated but still functional)
-    datetime.utcnow() so scans don't crash."""
+    """Safe UTC-now wrapper — belt-and-suspenders triple-fallback so even a
+    stale Render cache with half the imports can't crash the scan cycle.
+    (1) Try modern timezone.utc via module-level import (best).
+    (2) If 'timezone' NameError, local-import timezone from datetime module.
+    (3) If that also fails for any reason, deprecated but still valid utcnow()."""
     try:
         return datetime.now(timezone.utc)
     except NameError:
-        return datetime.utcnow()  # type: ignore[attr-defined]
+        try:
+            from datetime import timezone as _tz_local  # type: ignore
+            return datetime.now(_tz_local.utc)
+        except Exception:
+            return datetime.utcnow()  # type: ignore[attr-defined]
 
 from bybit_client import BybitClient, _format_api_error
 from market_data import MarketDataAdapter
@@ -328,13 +331,29 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
         strat = candidate.get("strategy") or "?"
         sym = candidate["symbol"]
         log.info("Auto-executing %s (%s) score=%.2f (approval %s)", sym, strat, score, approval_id)
+
+        # SCOPE 1 — broker execution only. Failures here mark the trade as FAILED.
+        order_id = None
         try:
             order_id = await executor.execute(candidate, approval_id)
             db.set_status(approval_id, "EXECUTED")
             executed_count += 1
             log.info("Auto-execute OK: %s (%s) score=%.2f → order_id=%s", sym, strat, score, order_id)
-            # Telegram notification (success) — this is your audit-trail arm.
-            # No button, just the trade receipt.
+        except Exception as e:
+            failed_executions += 1
+            log.exception("Auto-execute FAILED for approval %s (%s %s)", approval_id, sym, strat)
+            db.set_status(approval_id, "FAILED")
+            err_msg = f"⚠️ *TRADE FAILED*\n{sym} {strat} (score {score:.2f}): `{e}`"
+            try:
+                await notifier.send_note(err_msg, parse_mode="Markdown")
+            except Exception:
+                pass
+            continue
+
+        # SCOPE 2 — Telegram notification only. Broker already succeeded (EXECUTED).
+        # A Telegram failure here CANNOT downgrade the trade status or increment
+        # the failed_executions counter — the fill is final.
+        if order_id is not None:
             qty = candidate.get("suggested_qty") or candidate.get("num_contracts") or 1
             credit_debit = "credit" if candidate.get("is_credit") else "debit"
             price = candidate.get("est_price") or 0
@@ -355,16 +374,13 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
             if candidate.get("legs"):
                 for leg in candidate["legs"]:
                     msg += f"\n  • {leg.get('instruction','?')} {leg.get('option_symbol', leg.get('symbol','?'))}"
-            await notifier.send_note(msg, parse_mode="Markdown")
-        except Exception as e:
-            failed_executions += 1
-            log.exception("Auto-execute FAILED for approval %s (%s %s)", approval_id, sym, strat)
-            db.set_status(approval_id, "FAILED")
-            err_msg = f"⚠️ *TRADE FAILED*\n{sym} {strat} (score {score:.2f}): `{e}`"
             try:
-                await notifier.send_note(err_msg, parse_mode="Markdown")
-            except Exception:
-                pass
+                await notifier.send_note(msg, parse_mode="Markdown")
+            except Exception as notifier_err:
+                log.warning(
+                    "Telegram success notification failed (non-fatal, order_id=%s): %s",
+                    order_id, notifier_err,
+                )
 
     # --- Scan-cycle summary (heartbeat + confirms loop is alive) ---
     # Daily cap usage
