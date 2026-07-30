@@ -33,7 +33,7 @@ DEFAULTS = {
     "max_positions_per_symbol": 10**9,
     "max_new_trades_per_day": 10**9,
     "min_contracts_per_trade": 1,
-    "max_contracts_per_trade": 10**9,
+    "max_contracts_per_trade": 100,  # realistic cap; cheap altcoins still produce sane qty
     "min_credit_dollars": 0.0,
     "max_credit_dollars": 0.0,
     "min_debit_dollars": 0.0,

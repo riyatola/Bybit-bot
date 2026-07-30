@@ -300,6 +300,44 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
     all_candidates = [sentiment.apply(c) for c in all_candidates]
     all_candidates.sort(key=lambda c: c["score"], reverse=True)
 
+    # BYBIT TESTNET / LIVE SYMBOL WHITELIST.
+    # When routing to the real Bybit API (paper-mode with keys, or live mode) we
+    # MUST skip altcoin option candidates because Bybit option chains only
+    # list BTC & ETH on Testnet (and a broader but still limited set on
+    # mainnet). Any altcoin here will 100% fail with ErrCode 10001
+    # "Contract name does not exist" — wasteful submit + fills the trades
+    # table with useless FAILED rows. Pure in-memory paper mode keeps the
+    # full 10-symbol synthetic universe.
+    TESTNET_ONLY_OPTION_UNIVERSE = {"BTC", "ETH"}
+    real_bybit_mode = (account_hash != "PAPER0")
+    if real_bybit_mode:
+        filtered = []
+        skipped_altcoins = 0
+        for c in all_candidates:
+            sym = (c.get("symbol") or "").upper()
+            if sym in TESTNET_ONLY_OPTION_UNIVERSE:
+                filtered.append(c)
+            else:
+                skipped_altcoins += 1
+        if skipped_altcoins:
+            log.warning(
+                "Skipped %d altcoin candidates (%s) before exec — Bybit Testnet/Live only "
+                "supports option chains for %s at this time. Submit BOT_PURE_PAPER=1 to run "
+                "the full 10-asset synthetic universe locally instead. See: "
+                "https://testnet.bybit.com/app/unified/trade/option/BTCUSDT",
+                skipped_altcoins,
+                ", ".join(sorted({
+                    (c.get("symbol") or "").upper() for c in all_candidates
+                    if (c.get("symbol") or "").upper() not in TESTNET_ONLY_OPTION_UNIVERSE
+                })),
+                ", ".join(sorted(TESTNET_ONLY_OPTION_UNIVERSE)),
+            )
+        all_candidates = filtered
+        log.info(
+            "After Testnet/live option-whitelist filter: %d candidates remain (all BTC/ETH)",
+            len(all_candidates),
+        )
+
     gates_passed = 0
     executed_count = 0
     failed_executions = 0
