@@ -292,7 +292,14 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
             log.exception("Strategy %s scan failed — skipping this cycle", name)
 
     total_candidates = len(all_candidates)
-    log.info("Found %d raw candidates", total_candidates)
+    # Per-symbol breakdown (quick sanity check; helps confirm BTC/ETH are producing
+    # candidates instead of only altcoins that the whitelist will drop).
+    sym_counts: dict[str, int] = {}
+    for c in all_candidates:
+        s = (c.get("symbol") or "?").upper()
+        sym_counts[s] = sym_counts.get(s, 0) + 1
+    sym_breakdown = ", ".join(f"{s}={n}" for s, n in sorted(sym_counts.items(), key=lambda x: -x[1]))
+    log.info("Found %d raw candidates — per-symbol: %s", total_candidates, sym_breakdown or "(none)")
 
     # Apply learning, Bybit alpha, and sentiment adjustments
     all_candidates = [learning.apply(c) for c in all_candidates]
@@ -333,9 +340,14 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
                 ", ".join(sorted(TESTNET_ONLY_OPTION_UNIVERSE)),
             )
         all_candidates = filtered
+        post_sym: dict[str, int] = {}
+        for c in all_candidates:
+            s = (c.get("symbol") or "?").upper()
+            post_sym[s] = post_sym.get(s, 0) + 1
+        post_breakdown = ", ".join(f"{s}={n}" for s, n in sorted(post_sym.items(), key=lambda x: -x[1]))
         log.info(
-            "After Testnet/live option-whitelist filter: %d candidates remain (all BTC/ETH)",
-            len(all_candidates),
+            "After Testnet/live option-whitelist filter: %d candidates remain — per-symbol: %s",
+            len(all_candidates), post_breakdown or "(none)",
         )
 
     gates_passed = 0
@@ -421,16 +433,26 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
                 )
 
     # --- Scan-cycle summary (heartbeat + confirms loop is alive) ---
-    # Daily cap usage
+    # Daily cap usage — single authoritative source: approvals table (every
+    # gate-pass lands here). Count only statuses that "consume" a cap slot
+    # (PENDING waiting on human, APPROVED queued, EXECUTED filled). Explicitly
+    # exclude FAILED/REJECTED/CANCELLED/EXPIRED so execution bugs don't
+    # permanently saturate the day with zero-success rows.
     day_cap = risk.cfg.get("max_new_trades_per_day")
     today_iso = date.today().isoformat()
-    approvals_today = db.count_trades_today(today_iso)
-    pending_rows = risk.conn.execute(
-        "SELECT COUNT(*) FROM approvals WHERE status='PENDING' AND created_at LIKE ?",
+    approvals_count_row = risk.conn.execute(
+        "SELECT COUNT(*) FROM approvals WHERE created_at LIKE ? "
+        "AND status NOT IN ('FAILED','REJECTED','CANCELLED','EXPIRED')",
         (f"{today_iso}%",),
     ).fetchone()
-    pending_n = pending_rows[0] if pending_rows else 0
-    total_today = approvals_today + pending_n
+    total_today = approvals_count_row[0] if approvals_count_row else 0
+
+    # Breakdown detail (useful for debugging the cap)
+    breakdown_rows = risk.conn.execute(
+        "SELECT status, COUNT(*) FROM approvals WHERE created_at LIKE ? GROUP BY status",
+        (f"{today_iso}%",),
+    ).fetchall()
+    breakdown = ", ".join(f"{s}={n}" for s, n in breakdown_rows) if breakdown_rows else "no rows"
 
     # Open positions count
     open_rows = risk.conn.execute(
@@ -441,6 +463,8 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
     cap_str = (
         f"day-cap={total_today}/{day_cap}" if day_cap else f"day-cap={total_today}/∞"
     )
+    if breakdown:
+        cap_str += f" [{breakdown}]"
 
     dt_ms = int((_utcnow() - t_start).total_seconds() * 1000)
     log.info(
@@ -565,7 +589,7 @@ async def _run_forever_interval(name: str, seconds: int, coro_fn, *args,
                 raise
         finally:
             dt_ms = int((_utcnow() - t0).total_seconds() * 1000)
-            log.info("Task %s tick complete — took %dms", name, dt_ms)
+            log.info("Task %s tick complete — took %dms | next run in %ds (≈%.1fm)", name, dt_ms, seconds, seconds / 60.0)
             mark_event(name)
         try:
             await asyncio.sleep(seconds)

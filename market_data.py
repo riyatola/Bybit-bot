@@ -226,7 +226,40 @@ class MarketDataAdapter:
             instruments = []
 
         if instruments and tickers:
-            return self._chain_from_live(instruments, tickers, dte_min, dte_max, spot)
+            live_chain = self._chain_from_live(instruments, tickers, dte_min, dte_max, spot)
+            # Check if the live chain is usable (not just technically non-empty
+            # but actually has enough strikes across dte window that strategies
+            # can find something). Bybit testnet options are notoriously
+            # illiquid: often 1–2 expiry buckets with 1–3 strikes each, all
+            # bid=0 and greeks=0. That's worse than useless because the
+            # nearest_by_delta selector picks garbage.
+            total_options = sum(
+                len(bucket.get("calls", [])) + len(bucket.get("puts", []))
+                for bucket in live_chain.values()
+            )
+            expiries_in_range = len(live_chain)
+            MIN_TOTAL_OPTIONS = 30
+            MIN_EXPIRIES = 2
+            chain_looks_healthy = (
+                total_options >= MIN_TOTAL_OPTIONS
+                and expiries_in_range >= MIN_EXPIRIES
+            )
+            if chain_looks_healthy or not self._allow_synthetic:
+                if not chain_looks_healthy:
+                    log.critical(
+                        "LIVE DATA FAILURE: %s option chain is too sparse "
+                        "(%d options across %d expiries in dte=[%d,%d]) — "
+                        "returning empty because synthetic is disabled (live mode).",
+                        underlying, total_options, expiries_in_range, dte_min, dte_max,
+                    )
+                    return {}
+                return live_chain
+            # Testnet/paper mode: live chain is junk, fall through to synthetic.
+            log.debug(
+                "Live option chain for %s is too sparse (%d options / %d expiries, "
+                "need >=%d options and >=%d expiries) — falling back to synthetic feed.",
+                underlying, total_options, expiries_in_range, MIN_TOTAL_OPTIONS, MIN_EXPIRIES,
+            )
 
         # Paper mode only: deterministic synthetic chain so the rest of the
         # pipeline is exercisable without Bybit option data.
@@ -278,6 +311,21 @@ class MarketDataAdapter:
                 mark = self._bs_price(spot, strike, max(dte, 1) / 365.0, 0.05, 0.6, side == "calls")
                 bid = round(max(mark * 0.95, 0.01), 4)
                 ask = round(mark * 1.05, 4)
+
+            # Greeks: if testnet ticker returned zeros (common for illiquid strikes),
+            # compute them from Black-Scholes so nearest_by_delta and the risk
+            # engine can size and filter candidates correctly. A zero delta on
+            # every single option causes nearest_by_delta to always return the
+            # first strike regardless of target_delta.
+            IV_FALLBACK = 0.60
+            if abs(delta) < 1e-9:
+                delta = self._bs_delta(spot, strike, max(dte, 1) / 365.0, 0.05, IV_FALLBACK, side == "calls")
+            if abs(gamma) < 1e-12:
+                gamma = self._bs_gamma(spot, strike, max(dte, 1) / 365.0, 0.05, IV_FALLBACK)
+            if abs(vega) < 1e-9:
+                vega = self._bs_vega(spot, strike, max(dte, 1) / 365.0, 0.05, IV_FALLBACK)
+            if abs(theta) < 1e-9:
+                theta = self._bs_theta(spot, strike, max(dte, 1) / 365.0, 0.05, IV_FALLBACK, side == "calls")
 
             out.setdefault(expiry_str, {"calls": [], "puts": []})[side].append({
                 "symbol": sym,
