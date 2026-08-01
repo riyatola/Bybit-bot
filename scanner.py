@@ -29,7 +29,7 @@ def _utcnow() -> datetime:
 
 from bybit_client import BybitClient, _format_api_error
 from market_data import MarketDataAdapter
-from paper_broker import PaperBrokerClient
+from paper_broker import PaperBrokerClient, HybridTestnetBroker
 from risk_manager import RiskManager
 from approval_manager import Db
 from notifier import TelegramNotifier
@@ -315,8 +315,12 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
     # "Contract name does not exist" — wasteful submit + fills the trades
     # table with useless FAILED rows. Pure in-memory paper mode keeps the
     # full 10-symbol synthetic universe.
+    # EXCEPTION: BOT_ALTCOIN_MOCK=1 — HybridTestnetBroker accepts all 10
+    # symbols because altcoins are filled locally (paper) while BTC/ETH still
+    # route to real Bybit. In that mode we deliberately bypass this filter.
     TESTNET_ONLY_OPTION_UNIVERSE = {"BTC", "ETH"}
-    real_bybit_mode = (account_hash != "PAPER0")
+    hybrid_mode = isinstance(client, HybridTestnetBroker)
+    real_bybit_mode = (account_hash != "PAPER0") and not hybrid_mode
     if real_bybit_mode:
         filtered = []
         skipped_altcoins = 0
@@ -330,7 +334,8 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
             log.warning(
                 "Skipped %d altcoin candidates (%s) before exec — Bybit Testnet/Live only "
                 "supports option chains for %s at this time. Submit BOT_PURE_PAPER=1 to run "
-                "the full 10-asset synthetic universe locally instead. See: "
+                "the full 10-asset synthetic universe locally, or BOT_ALTCOIN_MOCK=1 to let "
+                "altcoins fill locally (paper) while BTC/ETH still route to the Bybit UI. See: "
                 "https://testnet.bybit.com/app/unified/trade/option/BTCUSDT",
                 skipped_altcoins,
                 ", ".join(sorted({
@@ -348,6 +353,13 @@ async def run_scan_cycle(client, account_hash, cfg, market_data, risk, db, notif
         log.info(
             "After Testnet/live option-whitelist filter: %d candidates remain — per-symbol: %s",
             len(all_candidates), post_breakdown or "(none)",
+        )
+    elif hybrid_mode:
+        # Altcoin whitelist is intentionally bypassed in hybrid mode.
+        log.info(
+            "BOT_ALTCOIN_MOCK=1 (hybrid mode active) — bypassing BTC/ETH-only whitelist. "
+            "BTC/ETH will route to Bybit Testnet; %s will fill locally as mock paper trades.",
+            ", ".join(sorted(get_universe(cfg) - {"BTC", "ETH"})),
         )
 
     gates_passed = 0
@@ -695,22 +707,49 @@ async def main():
              get_port(), os.environ.get("PORT"))
 
     # Choose broker:
-    #   - BOT_PURE_PAPER=1  → pure in-memory Python paper broker, zero Bybit calls on writes.
-    #   - mode="paper" (the default, env config) → Bybit Testnet trading IF the API
-    #     keys are set. Orders, positions, and P&L all appear inside the real Bybit
-    #     Testnet web/mobile "Positions / Orders / Assets" UI, so you can visually
-    #     follow the bot without real-money risk.
-    #   - mode="live" → Bybit mainnet with real credentials.
+    #   - BOT_PURE_PAPER=1        → pure in-memory Python paper broker, zero Bybit calls on writes.
+    #   - BOT_ALTCOIN_MOCK=1      → HYBRID mode (testnet). BTC/ETH orders go to real Bybit Testnet
+    #                                (UI-visible), altcoins fill locally via paper broker but use real
+    #                                Bybit spot/alpha/chain data and persist to Turso for training.
+    #   - mode="paper" (default)  → Bybit Testnet trading IF the API keys are set. Orders,
+    #                                positions, P&L appear in the real Bybit "Unified Demo Trading" UI.
+    #   - mode="live"             → Bybit mainnet with real credentials.
     force_pure_paper_env = os.environ.get("BOT_PURE_PAPER", "").strip().lower() in {"1", "true", "yes"}
+    hybrid_altcoin_mock_env = os.environ.get("BOT_ALTCOIN_MOCK", "").strip().lower() in {"1", "true", "yes"}
     mode_name = cfg.get("mode", "paper")
     use_pure_python_paper = force_pure_paper_env
     if not use_pure_python_paper:
         has_bybit_keys = bool(bybit_cfg.get("api_key")) and bool(bybit_cfg.get("api_secret"))
         testnet_on = bybit_cfg.get("testnet", True)
-        if mode_name == "paper" and has_bybit_keys and testnet_on:
+        if mode_name == "paper" and has_bybit_keys and testnet_on and hybrid_altcoin_mock_env:
+            # ── New: hybrid training mode ──
+            # BTC/ETH fills go to Bybit Testnet (UI visible). All altcoins (SOL, BNB,
+            # XRP, DOGE, ADA, AVAX, MATIC, DOT) fill locally via paper broker, but:
+            #   (a) strategies still consume real Bybit spot/alpha/skew data for them;
+            #   (b) trades are persisted to the shared Turso trades table just like
+            #       real trades; (c) outcomes feed learning.py + guardrails.py exactly
+            #       the same way, so you accumulate 10-asset training history even
+            #       though Bybit testnet only lists options for BTC/ETH.
+            log.info(
+                "BOT_ALTCOIN_MOCK=1 — HYBRID TESTNET MODE. BTC/ETH → real Bybit Testnet fills "
+                "(UI-visible); altcoins → local paper-simulated fills recorded in Turso for ML training. "
+                "Set BOT_ALTCOIN_MOCK=0/unset to go back to BTC/ETH-only testnet trading."
+            )
+            log.info(
+                "Bybit Testnet setup checklist: (1) Upgrade to Unified Trading Account (UTA) "
+                "at https://testnet.bybit.com/app/user/overview ; (2) claim free USDC/USDT "
+                "from the Testnet Asset Hub Faucet at https://testnet.bybit.com/app/user/wallet/asset-hub "
+                "(options settle in USDC); (3) only BTC/ETH appear in Bybit UI — the other 8 "
+                "symbols accumulate as mock local positions in Turso for training."
+            )
+            client = HybridTestnetBroker(real_client, cfg)
+            account_hash = client._account_hash  # "BYBIT-TESTNET-HYBRID"
+        elif mode_name == "paper" and has_bybit_keys and testnet_on:
             log.info(
                 "Paper-mode routing to BYBIT TESTNET for fills (UI-visible trades). "
-                "Set BOT_PURE_PAPER=1 to use the isolated in-memory paper broker instead."
+                "Set BOT_PURE_PAPER=1 to use the isolated in-memory paper broker instead, "
+                "or set BOT_ALTCOIN_MOCK=1 to enable 10-symbol training history while keeping "
+                "BTC/ETH orders UI-visible in Bybit."
             )
             log.info(
                 "Bybit Testnet setup checklist: (1) Upgrade to Unified Trading Account (UTA) "
@@ -718,7 +757,7 @@ async def main():
                 "from the Testnet Asset Hub Faucet at https://testnet.bybit.com/app/user/wallet/asset-hub "
                 "(options settle in USDC); (3) only symbols Bybit actually lists in testnet "
                 "options (BTC, ETH typically) will fill — altcoins may be rejected with "
-                "'symbol not exist' until mainnet."
+                "'symbol not exist' until mainnet (or enable BOT_ALTCOIN_MOCK=1 for simulated alt fills)."
             )
             client = real_client
             account_hash = "BYBIT-TESTNET"

@@ -535,3 +535,282 @@ class PaperBrokerClient:
         if is_call:
             return round(S * self._norm_cdf(d1) - K * math.exp(-r * T) * self._norm_cdf(d2), 4)
         return round(K * math.exp(-r * T) * self._norm_cdf(-d2) - S * self._norm_cdf(-d1), 4)
+
+
+# Symbols that actually have live option chains on Bybit Testnet today.
+# Everything else in the 10-symbol universe will be simulated locally by the
+# hybrid broker while still feeding real Bybit spot / alpha / vol data through
+# the strategy layer (so the historical record is useful for training).
+BYBIT_TESTNET_LIVE_OPTION_UNIVERSE = frozenset({"BTC", "ETH"})
+
+
+class HybridTestnetBroker:
+    """Dual-path testnet broker.
+
+    Intended use: testnet paper mode where you want the full 10-symbol
+    universe accumulating in Turso for training (learning.py / guardrails.py),
+    but Bybit itself only lists options for BTC and ETH on testnet.
+
+    Behaviour per order leg:
+      - Legs on BTC / ETH -> forwarded verbatim to the real Bybit Testnet API
+        so they appear visually in the Bybit "Unified Demo Trading" UI.
+      - Legs on all other symbols -> filled locally against a PaperBrokerClient
+        that uses REAL Bybit spot prices (get_linear_tickers) and REAL Bybit
+        alpha signals. Positions settle locally, but the trade is recorded in
+        the shared SQL trades table via executor / trade_tracker the same way
+        a real order would be, so ML training data is indistinguishable for
+        altcoins vs BTC/ETH (apart from the `mock=true` flag stored on the
+        order for debuggability).
+
+    This class intentionally mirrors the BybitClient + PaperBrokerClient
+    surface so scanner.py / executor.py / risk_manager.py do not need any
+    mode-specific branching beyond picking the right broker class at boot.
+    """
+
+    def __init__(self, real_client: object, cfg: dict):
+        self.real = real_client
+        self.cfg = cfg
+        # Single shared paper broker handles all altcoin fills.
+        self.alt_paper = PaperBrokerClient(real_client, cfg)
+        # Override the paper account hash so risk_manager.account_snapshot
+        # still reports the right "account number" downstream.
+        self.alt_paper._account_hash = "BYBIT-TESTNET-HYBRID"
+        self._account_hash = "BYBIT-TESTNET-HYBRID"
+        self.live_underlyings = set(BYBIT_TESTNET_LIVE_OPTION_UNIVERSE)
+        log.info(
+            "HybridTestnetBroker initialised — live fills on %s, local paper "
+            "simulation for all other underlyings (altcoin training data mode).",
+            ", ".join(sorted(self.live_underlyings)),
+        )
+
+    # ------------------------------------------------------------------
+    # Identity helpers
+    # ------------------------------------------------------------------
+
+    def account_info(self) -> dict:
+        real_info = {"mode": "hybrid-testnet"}
+        try:
+            real_info["bybit_ui"] = self.real.account_info()
+        except Exception as e:
+            real_info["bybit_ui"] = f"unavailable: {e}"
+        real_info["altcoin_paper"] = self.alt_paper.account_info()
+        return real_info
+
+    # ------------------------------------------------------------------
+    # Market data: ALL symbols go to the real Bybit client, no faking here.
+    # This is the key property of the hybrid mode: strategies see real
+    # liquidity/vol/skew data for every coin, not a synthetic series.
+    # ------------------------------------------------------------------
+
+    def get_option_chain_bybit(self, underlying: str, category: str = "option",
+                               base_coin: str | None = None) -> list[dict]:
+        return self.real.get_option_chain_bybit(underlying, category, base_coin)
+
+    def get_option_tickers(self, base_coin: str = "BTC") -> list[dict]:
+        return self.real.get_option_tickers(base_coin)
+
+    def get_linear_tickers(self, category: str = "linear") -> list[dict]:
+        return self.real.get_linear_tickers(category)
+
+    def get_linear_ticker(self, symbol: str):
+        return self.real.get_linear_ticker(symbol)
+
+    def get_long_short_ratio(self, symbol: str, period: str = "1h", limit: int = 3) -> list[dict]:
+        return self.real.get_long_short_ratio(symbol, period, limit)
+
+    # ------------------------------------------------------------------
+    # Order routing — dispatch per leg by underlying.
+    #   - BTC/ETH only orders -> send to real Bybit
+    #   - All altcoin-only orders -> paper broker (local fill)
+    #   - Mixed (shouldn't happen in this repo but be defensive) -> split.
+    # ------------------------------------------------------------------
+
+    def place_order(self, account_hash: str, payload: dict) -> _FakeResponse:
+        legs = payload.get("orderLegCollection", [])
+        if not legs:
+            return _FakeResponse(400, body={"error": "empty order"})
+
+        live_legs = []
+        paper_legs = []
+        for leg in legs:
+            instr = leg.get("instrument", {}) or {}
+            sym = instr.get("symbol", "") or ""
+            asset_type = (instr.get("assetType") or "OPTION").upper()
+            underlying = self._extract_underlying(sym, asset_type)
+            if underlying in self.live_underlyings:
+                live_legs.append(leg)
+            else:
+                paper_legs.append(leg)
+
+        # Altcoin-only order: paper route. Guaranteed to fill if cash/margin OK.
+        if not live_legs:
+            log.info(
+                "HYBRID: altcoin-only order — filling via paper broker. Underlyings: %s",
+                sorted({self._extract_underlying((l.get("instrument") or {}).get("symbol", ""),
+                                                  (l.get("instrument") or {}).get("assetType"))
+                        for l in paper_legs}),
+            )
+            resp = self.alt_paper.place_order(account_hash, payload)
+            # Tag the paper order so downstream (trade_tracker, learning) can
+            # identify locally-settled fills vs ones reported by Bybit.
+            try:
+                body = resp.body if isinstance(resp.body, dict) else {}
+                body["hybrid_mock"] = True
+                body["account_hash"] = self._account_hash
+            except Exception:
+                pass
+            return resp
+
+        # Live-only order: pass-through to Bybit Testnet unchanged.
+        if not paper_legs:
+            return self.real.place_order(account_hash, payload)
+
+        # Mixed order — extremely unlikely for single-underlying strategies,
+        # but if it ever happens, reject cleanly instead of creating a half-live
+        # half-paper franken-order that can't be reconciled later.
+        log.error(
+            "HYBRID: rejecting mixed live+paper multi-leg order. "
+            "Live underlyings: %s / Paper underlyings: %s",
+            sorted({self._extract_underlying((l.get("instrument") or {}).get("symbol", ""),
+                                              (l.get("instrument") or {}).get("assetType"))
+                    for l in live_legs}),
+            sorted({self._extract_underlying((l.get("instrument") or {}).get("symbol", ""),
+                                              (l.get("instrument") or {}).get("assetType"))
+                    for l in paper_legs}),
+        )
+        return _FakeResponse(400, body={
+            "error": "HYBRID_MIXED_UNDERLYINGS",
+            "message": "A single candidate order cannot span both live Bybit "
+                       "underlyings (BTC/ETH) and locally-mocked altcoins. Split it.",
+        })
+
+    # ------------------------------------------------------------------
+    # Positions / transactions / settlement — MERGED view.
+    # So risk_manager, trade_tracker, and exits see ONE unified account.
+    # ------------------------------------------------------------------
+
+    def account_details(self, account_hash: str, fields: str = "positions") -> _FakeResponse:
+        # Pull real Bybit positions first (always authoritative for BTC/ETH).
+        try:
+            real_resp = self.real.account_details(account_hash, fields)
+            real_body = real_resp.json() if hasattr(real_resp, "json") else (real_resp.body or {})
+        except Exception as e:
+            log.warning("Hybrid account_details: real Bybit fetch failed (%s) — returning paper-only view.", e)
+            real_body = {"securitiesAccount": {"positions": [], "net_liq": 0.0, "cash_available": 0.0}}
+
+        paper_resp = self.alt_paper.account_details(self.alt_paper._account_hash, fields)
+        paper_body = paper_resp.body or {}
+
+        real_sec = (real_body.get("securitiesAccount") if isinstance(real_body, dict) else None) or {}
+        paper_sec = (paper_body.get("securitiesAccount") if isinstance(paper_body, dict) else None) or {}
+
+        merged_positions = list(real_sec.get("positions", []) or [])
+        merged_positions.extend(list(paper_sec.get("positions", []) or []))
+
+        def _num(v, default=0.0):
+            try:
+                return float(v) if v is not None else default
+            except (ValueError, TypeError):
+                return default
+
+        merged = {
+            "securitiesAccount": {
+                "accountNumber": self._account_hash,
+                "type": "HYBRID_TESTNET",
+                "roundTrips": int(real_sec.get("roundTrips", 0) or 0),
+                "isDayTrader": bool(real_sec.get("isDayTrader", False)),
+                "cash_available": _num(real_sec.get("cash_available")) + _num(paper_sec.get("cash_available")),
+                "cash": _num(real_sec.get("cash")) + _num(paper_sec.get("cash")),
+                "net_liq": _num(real_sec.get("net_liq")) + _num(paper_sec.get("net_liq")),
+                "liquidationValue": _num(real_sec.get("liquidationValue")) + _num(paper_sec.get("liquidationValue")),
+                "positions": merged_positions,
+            }
+        }
+        return _FakeResponse(200, body=merged)
+
+    def _fetch_derivative_positions(self) -> list[dict]:
+        """Merged perp exposure (for DeltaHedger) — both routes."""
+        real_perps: list[dict] = []
+        try:
+            if hasattr(self.real, "_fetch_derivative_positions"):
+                real_perps = list(self.real._fetch_derivative_positions() or [])
+        except Exception:
+            pass
+        paper_perps = list(self.alt_paper._fetch_derivative_positions() or [])
+        merged: dict[str, dict] = {}
+        for row in real_perps + paper_perps:
+            instr = row.get("instrument", {}) or {}
+            sym = instr.get("symbol", "")
+            if not sym:
+                continue
+            if sym not in merged:
+                merged[sym] = {"instrument": dict(instr), "longQuantity": 0.0, "shortQuantity": 0.0}
+            merged[sym]["longQuantity"] = float(merged[sym]["longQuantity"] or 0) + float(row.get("longQuantity") or 0)
+            merged[sym]["shortQuantity"] = float(merged[sym]["shortQuantity"] or 0) + float(row.get("shortQuantity") or 0)
+        return list(merged.values())
+
+    def transactions(self, account_hash: str, symbol: str | None = None,
+                     types: str = "TRADE", start_date: str | None = None,
+                     end_date: str | None = None) -> _FakeResponse:
+        real_txns: list[dict] = []
+        try:
+            resp = self.real.transactions(account_hash, symbol=symbol, types=types,
+                                          start_date=start_date, end_date=end_date)
+            body = resp.json() if hasattr(resp, "json") else (resp.body or {})
+            real_txns = list(body if isinstance(body, list) else body.get("transactions", []) or [])
+        except Exception as e:
+            log.warning("Hybrid transactions: real Bybit fetch failed: %s", e)
+
+        paper_resp = self.alt_paper.transactions(account_hash, symbol=symbol, types=types,
+                                                 start_date=start_date, end_date=end_date)
+        paper_body = paper_resp.body or {}
+        paper_txns = list(paper_body if isinstance(paper_body, list) else paper_body.get("transactions", []) or [])
+        # Tag each so training consumers can audit if needed
+        for t in paper_txns:
+            if isinstance(t, dict) and "hybrid_mock" not in t:
+                t["hybrid_mock"] = True
+        return _FakeResponse(200, body={"transactions": real_txns + paper_txns})
+
+    # ------------------------------------------------------------------
+    # Settlement — called from scanner scheduled task. Altcoin paper legs
+    # settle on their expiry exactly like pure paper mode. BTC/ETH still
+    # settle on Bybit's side (we just fetch the result via the normal
+    # trade_tracker outcome-poll path on those symbols).
+    # ------------------------------------------------------------------
+
+    def settle_expired_positions(self) -> float:
+        pnl = 0.0
+        try:
+            pnl += float(self.alt_paper.settle_expired_positions() or 0.0)
+        except Exception as e:
+            log.warning("Hybrid settle: altcoin paper settle raised: %s", e)
+        return pnl
+
+    # ------------------------------------------------------------------
+    # Public introspection used by scanner.py's whitelist filter.
+    # ------------------------------------------------------------------
+
+    def is_mocked_underlying(self, symbol: str) -> bool:
+        """True if `symbol` (underlying e.g. 'SOL', NOT an option OCC) is
+        being filled locally rather than routed to Bybit Testnet."""
+        return str(symbol or "").upper() not in self.live_underlyings
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_underlying(option_or_perp_symbol: str, asset_type: str = "OPTION") -> str:
+        s = (option_or_perp_symbol or "").upper()
+        asset_type = (asset_type or "OPTION").upper()
+        if asset_type == "CRYPTO":
+            # e.g. SOLUSDT, BTCPERP
+            for suf in ("USDT", "USDC", "PERP"):
+                if s.endswith(suf):
+                    return s[: -len(suf)]
+            return s
+        # Option: BTC-15AUG25-65000-C or SOL-2025-08-15-200-P
+        sep = s.find("-")
+        if sep <= 0:
+            return s
+        return s[:sep]

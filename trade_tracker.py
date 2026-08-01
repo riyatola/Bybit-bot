@@ -46,6 +46,8 @@ def ensure_trade_outcome_columns(conn: sqlite3.Connection):
         "ALTER TABLE trades ADD COLUMN expiration TEXT",     # expiration date of the position
         "ALTER TABLE trades ADD COLUMN exit_approval_id TEXT", # if we generated an exit approval
         "ALTER TABLE trades ADD COLUMN entry_greeks_json TEXT", # PortfolioGreeks-per-contract + contracts, for portfolio aggregation
+        "ALTER TABLE trades ADD COLUMN order_id TEXT",         # broker-assigned order id (Bybit, Paper, Hybrid)
+        "ALTER TABLE trades ADD COLUMN mock_order BOOLEAN DEFAULT 0",  # 1 = simulated local paper fill (BOT_ALTCOIN_MOCK)
     ):
         try:
             conn.execute(stmt)
@@ -89,7 +91,7 @@ class TradeTracker:
         Finds EXECUTED trades with outcome OPEN, checks if still held, and
         records the outcome once they've closed."""
         open_trades = self.conn.execute(
-            "SELECT id, symbol, order_json, schwab_order_id, created_at FROM trades "
+            "SELECT id, symbol, order_json, order_id, schwab_order_id, created_at FROM trades "
             "WHERE status='EXECUTED' AND (outcome='OPEN' OR outcome IS NULL)"
         ).fetchall()
         if not open_trades:
@@ -103,26 +105,62 @@ class TradeTracker:
 
         updated = 0
         cutoff = datetime.utcnow() - timedelta(days=lookback_days)
-        for trade_id, symbol, order_json, schwab_order_id, created_at in open_trades:
+        for trade_id, symbol, order_json, order_id, schwab_order_id, created_at in open_trades:
             try:
                 created = datetime.fromisoformat(created_at)
             except ValueError:
                 created = None
             if created and created < cutoff:
-                # too old to still be a live position we'd expect to see; give up cleanly
                 self._mark_outcome(trade_id, None, "CLOSED_UNKNOWN_PNL")
                 updated += 1
                 continue
 
             import json
-            occ_symbols = {leg["instrument"]["symbol"] for leg in json.loads(order_json).get("orderLegCollection", [])}
+            try:
+                occ_symbols = {
+                    leg["instrument"]["symbol"]
+                    for leg in json.loads(order_json or "[]" if "[" in (order_json or "") else '{"legs":[]}').get(
+                        "orderLegCollection", []
+                    )
+                }
+            except Exception:
+                occ_symbols = set()
             if occ_symbols & held_symbols:
-                continue  # still open, nothing to do yet
+                continue  # still open
 
-            pnl = self._lookup_realized_pnl(schwab_order_id, symbol)
+            # Try multiple ID fields — (1) bybit broker order_id we set,
+            # (2) schwab_order_id legacy col, (3) fallback to symbol scan.
+            pnl = self._lookup_realized_pnl(order_id or schwab_order_id, symbol)
+            if pnl is None:
+                pnl = self._lookup_realized_pnl(schwab_order_id, symbol)
             outcome = "CLOSED_UNKNOWN_PNL"
             if pnl is not None:
                 outcome = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAKEVEN")
+            else:
+                # For mock/paper altcoins settle_expired_positions() already
+                # moved cash into the paper account's ledger but the txn scan
+                # above may have missed it if ID naming differs. Try expiry
+                # based resolution so trades still land in training data.
+                try:
+                    exp = self.conn.execute(
+                        "SELECT expiration, entry_price, is_credit FROM trades WHERE id=?", (trade_id,)
+                    ).fetchone()
+                    if exp:
+                        import datetime as _dt
+                        exp_str, entry, is_credit = exp
+                        if exp_str and datetime.fromisoformat(exp_str).date() < _dt.date.today():
+                            # Try paper broker intrinsic settlement fallback
+                            # via broker client (only works if broker has spot).
+                            pnl_fb = self._intrinsic_pnl_fallback(symbol, occ_symbols, entry, is_credit)
+                            if pnl_fb is not None:
+                                pnl = pnl_fb
+                                outcome = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAKEVEN")
+                                log.info(
+                                    "Trade %s (%s): no txn found, settled fallback @ intrinsic = %+0.2f",
+                                    trade_id, symbol, pnl,
+                                )
+                except Exception as e:
+                    log.debug("Fallback intrinsic settle for %s skipped: %s", trade_id, e)
             self._mark_outcome(trade_id, pnl, outcome)
             updated += 1
 
@@ -172,6 +210,59 @@ class TradeTracker:
                 total += float(amount)
                 found = True
         return total if found else None
+
+    def _intrinsic_pnl_fallback(self, underlying: str, occ_symbols: set,
+                                entry_price, is_credit) -> float | None:
+        """Best-effort settle for mock/paper altcoins whose transactions
+        couldn't be found by ID. Computes intrinsic value at expiry for each
+        option leg using the broker's real spot lookup, then nets against
+        the entry price (credit/debit) per 1 contract."""
+        try:
+            if len(occ_symbols) != 1 or entry_price is None:
+                return None
+            from datetime import date as _date, datetime as _dt, timedelta as _td
+            from strategies.base import parse_bybit_symbol
+            sym = next(iter(occ_symbols))
+            parsed = parse_bybit_symbol(sym)
+            if not parsed:
+                return None
+            exp = parsed["expiration"]
+            if isinstance(exp, str):
+                exp = _dt.fromisoformat(exp).date()
+            if exp > _date.today():
+                return None
+            spot = None
+            try:
+                if hasattr(self.client, "_get_spot"):
+                    spot = float(self.client._get_spot(underlying) or 0.0)
+                elif hasattr(self.client, "alt_paper") and hasattr(self.client.alt_paper, "_get_spot"):
+                    spot = float(self.client.alt_paper._get_spot(underlying) or 0.0)
+                else:
+                    for t in (getattr(self.client, "get_linear_tickers", lambda **k: [])() or []):
+                        if t.get("symbol") == f"{underlying.upper()}USDT":
+                            spot = float(t.get("markPrice") or t.get("lastPrice") or 0.0)
+                            break
+            except Exception:
+                pass
+            if spot is None or spot <= 0:
+                return None
+            K = float(parsed["strike"] or 0.0)
+            is_call = str(parsed.get("option_type") or "C").upper().startswith("C")
+            intrinsic = max(0.0, (spot - K) if is_call else (K - spot))
+            entry_price_f = float(entry_price or 0.0)
+            is_credit_bool = bool(is_credit) if isinstance(is_credit, (int, bool)) else (
+                str(is_credit).lower() in {"1", "true", "yes", "y", "t"} if is_credit else False
+            )
+            # Credit: you receive entry at entry_price, then pay intrinsic if ITM
+            # Debit : you paid entry at entry_price, then get intrinsic back
+            if is_credit_bool:
+                pnl_per = entry_price_f - intrinsic
+            else:
+                pnl_per = intrinsic - entry_price_f
+            return round(pnl_per, 4)
+        except Exception as e:
+            log.debug("intrinsic fallback failed for %s: %s", underlying, e)
+            return None
 
 
 def _extract_features(candidate: dict) -> dict:
