@@ -1,0 +1,6 @@
+STATUS=PASS
+py_compile bybit_client.py|True|
+import _FakeResponse|True|
+body == json() and same _body ref|True|
+body attr access no AttributeError|True|
+backward compat: json/status/headers/text unchanged|True|

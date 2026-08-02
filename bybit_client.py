@@ -66,6 +66,10 @@ class _FakeResponse:
         self.headers = headers if headers is not None else {}
         self._text = text
 
+    @property
+    def body(self):
+        return self._body
+
     def json(self):
         return self._body
 

@@ -693,13 +693,16 @@ class HybridTestnetBroker:
         # Pull real Bybit positions first (always authoritative for BTC/ETH).
         try:
             real_resp = self.real.account_details(account_hash, fields)
-            real_body = real_resp.json() if hasattr(real_resp, "json") else (real_resp.body or {})
+            if callable(getattr(real_resp, "json", None)):
+                real_body = real_resp.json()
+            else:
+                real_body = getattr(real_resp, "body", None) or {}
         except Exception as e:
             log.warning("Hybrid account_details: real Bybit fetch failed (%s) — returning paper-only view.", e)
             real_body = {"securitiesAccount": {"positions": [], "net_liq": 0.0, "cash_available": 0.0}}
 
         paper_resp = self.alt_paper.account_details(self.alt_paper._account_hash, fields)
-        paper_body = paper_resp.body or {}
+        paper_body = paper_resp.json() or {}
 
         real_sec = (real_body.get("securitiesAccount") if isinstance(real_body, dict) else None) or {}
         paper_sec = (paper_body.get("securitiesAccount") if isinstance(paper_body, dict) else None) or {}
@@ -756,14 +759,17 @@ class HybridTestnetBroker:
         try:
             resp = self.real.transactions(account_hash, symbol=symbol, types=types,
                                           start_date=start_date, end_date=end_date)
-            body = resp.json() if hasattr(resp, "json") else (resp.body or {})
+            if callable(getattr(resp, "json", None)):
+                body = resp.json()
+            else:
+                body = getattr(resp, "body", None) or {}
             real_txns = list(body if isinstance(body, list) else body.get("transactions", []) or [])
         except Exception as e:
             log.warning("Hybrid transactions: real Bybit fetch failed: %s", e)
 
         paper_resp = self.alt_paper.transactions(account_hash, symbol=symbol, types=types,
                                                  start_date=start_date, end_date=end_date)
-        paper_body = paper_resp.body or {}
+        paper_body = paper_resp.json() or {}
         paper_txns = list(paper_body if isinstance(paper_body, list) else paper_body.get("transactions", []) or [])
         # Tag each so training consumers can audit if needed
         for t in paper_txns:
